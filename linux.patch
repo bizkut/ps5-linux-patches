@@ -8917,7 +8917,7 @@ index 000000000000..111111111111
 +#define SALINA_MIN_GLUE_BAR2_SIZE	0x180028
 +#define SALINA_MIN_GLUE_BAR4_SIZE	0x4070
 +#define SALINA_MIN_XHCI_BAR_SIZE		0x129000
-+#define SALINA_POLL_INTERVAL_MS		100
++#define SALINA_POLL_INTERVAL_MS		1
 +
 +struct salina_xhci_state {
 +	struct pci_dev *glue;
