@@ -13,9 +13,16 @@ on:
         description: 'Patches branch/tag/SHA (empty = default)'
         default: ''
         type: string
+      release_notes:
+        description: 'Release notes'
+        default: ''
+        type: string
   workflow_call:
     inputs:
       patches_ref:
+        type: string
+        default: ''
+      release_notes:
         type: string
         default: ''
 jobs:
@@ -81,6 +88,8 @@ jobs:
           name: Kernel ${{ steps.version.outputs.kver }} (${{ steps.version.outputs.psha }})
           body: |
             PS5 Linux kernel packages for **${{ steps.version.outputs.kver }}**.
+
+            ${{ inputs.release_notes }}
 
             Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/ps5-linux/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
 
