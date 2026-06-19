@@ -9520,6 +9520,15 @@ index 83af325b7..f4a98bb37 100644
  	if (pci_choose_state(dev, PMSG_SUSPEND) == PCI_D0)
  		pm_runtime_put(&dev->dev);
  	else if (xhci->quirks & XHCI_DEFAULT_PM_RUNTIME_ALLOW)
+@@ -827,6 +845,8 @@ static void xhci_pci_shutdown(struct usb_hcd *hcd)
+ /* PCI driver selection metadata; PCI hotplugging uses this */
+ static const struct pci_device_id pci_ids[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_SONY, PCI_DEVICE_ID_PS5_SALINA_XHCI) },
++
+ 	/* handle any USB 3.0 xHCI controller */
+ 	{ PCI_DEVICE_CLASS(PCI_CLASS_SERIAL_USB_XHCI, ~0), },
+ 	{ /* end: all zeroes */ }
+ };
 diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
 index 93d989e73..bf3b363be 100644
 --- a/drivers/usb/host/Makefile
