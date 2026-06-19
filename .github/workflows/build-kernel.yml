@@ -8,7 +8,7 @@ on:
         description: 'Package format'
         default: 'all'
         type: choice
-        options: [deb, arch, all]
+        options: [deb, arch, rpm, all]
       patches_ref:
         description: 'Patches branch/tag/SHA (empty = default)'
         default: ''
@@ -19,6 +19,9 @@ on:
         type: string
   workflow_call:
     inputs:
+      format:
+        type: string
+        default: 'all'
       patches_ref:
         type: string
         default: ''
@@ -68,14 +71,17 @@ jobs:
           path: |
             image/linux-bin/*.deb
             image/linux-bin/*.pkg.tar.zst
+            image/linux-bin/*.rpm
           retention-days: 7
 
       - name: Compute checksums
         id: sha
         run: |
+          shopt -s nullglob
+          files=(image/linux-bin/*.deb image/linux-bin/*.pkg.tar.zst image/linux-bin/*.rpm)
           {
             echo 'sums<<SHAEOF'
-            sha256sum image/linux-bin/*.deb image/linux-bin/*.pkg.tar.zst | sed 's|image/linux-bin/||'
+            sha256sum "${files[@]}" | sed 's|image/linux-bin/||'
             echo 'SHAEOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -99,4 +105,5 @@ jobs:
           files: |
             image/linux-bin/*.deb
             image/linux-bin/*.pkg.tar.zst
+            image/linux-bin/*.rpm
           make_latest: true
