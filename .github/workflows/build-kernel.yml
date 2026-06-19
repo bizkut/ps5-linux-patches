@@ -26,15 +26,15 @@ jobs:
       contents: write
 
     env:
-      CCACHE_DIR: /home/opc/ccache
+      CCACHE_DIR: /home/bizkut/ccache
 
     steps:
       - name: Checkout image builder
         uses: actions/checkout@v6
         with:
-          repository: ps5-linux/ps5-linux-image
+          repository: bizkut/ps5-linux-image
           path: image
-          ref: main
+          ref: 7.1.1
 
       - name: Build kernel
         run: |
