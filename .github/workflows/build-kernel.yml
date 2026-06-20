@@ -17,6 +17,18 @@ on:
         description: 'Release notes'
         default: ''
         type: string
+      mwifiex:
+        description: 'Build optional PS5 IW620 mwifiex modules'
+        default: false
+        type: boolean
+      mwifiex_ref:
+        description: 'ps5-linux-mwifiex branch/tag/SHA'
+        default: 'main'
+        type: string
+      mwifiex_nxp_ref:
+        description: 'nxp-imx/mwifiex branch/tag/SHA'
+        default: 'lf-6.18.2_1.0.0'
+        type: string
   workflow_call:
     inputs:
       format:
@@ -28,6 +40,15 @@ on:
       release_notes:
         type: string
         default: ''
+      mwifiex:
+        type: boolean
+        default: false
+      mwifiex_ref:
+        type: string
+        default: 'main'
+      mwifiex_nxp_ref:
+        type: string
+        default: 'lf-6.18.2_1.0.0'
 jobs:
   build:
     runs-on: self-hosted
@@ -57,9 +78,17 @@ jobs:
         run: |
           FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
           PATCHES_REF="${{ inputs.patches_ref || '' }}"
+          MWIFIEX="${{ inputs.mwifiex || false }}"
+          MWIFIEX_REF="${{ inputs.mwifiex_ref || 'main' }}"
+          MWIFIEX_NXP_REF="${{ inputs.mwifiex_nxp_ref || 'lf-6.18.2_1.0.0' }}"
+          extra_args=()
+          if [ "$MWIFIEX" = "true" ]; then
+            extra_args+=(--mwifiex --mwifiex-ref "$MWIFIEX_REF" --mwifiex-nxp-ref "$MWIFIEX_NXP_REF")
+          fi
           bash image/build_image.sh --kernel-only \
             --distro "$FORMAT" \
-            --patches-ref "$PATCHES_REF"
+            --patches-ref "$PATCHES_REF" \
+            "${extra_args[@]}"
 
       - name: Build RPM package for all format
         run: |
