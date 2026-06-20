@@ -8885,7 +8885,7 @@ new file mode 100644
 index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,549 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Sony PlayStation 5 Salina xHCI glue and PHY setup.
@@ -8917,7 +8917,7 @@ index 000000000000..111111111111
 +#define SALINA_MIN_GLUE_BAR2_SIZE	0x180028
 +#define SALINA_MIN_GLUE_BAR4_SIZE	0x4070
 +#define SALINA_MIN_XHCI_BAR_SIZE		0x129000
-+#define SALINA_POLL_INTERVAL_MS		1
++#define SALINA_POLL_INTERVAL_MS		10
 +
 +struct salina_xhci_state {
 +	struct pci_dev *glue;
@@ -9373,6 +9373,7 @@ index 000000000000..111111111111
 +	struct xhci_hcd *xhci;
 +	struct xhci_interrupter *ir;
 +	unsigned long flags;
++	u32 status;
 +	bool resched = true;
 +
 +	poller = container_of(work, struct salina_xhci_poller, work.work);
@@ -9384,6 +9385,19 @@ index 000000000000..111111111111
 +		goto out_resched;
 +
 +	if (xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_REMOVING)) {
++		resched = false;
++		goto out_unlock;
++	}
++
++	status = readl(&xhci->op_regs->status);
++	if (status == ~(u32)0) {
++		xhci_hc_died(xhci);
++		resched = false;
++		goto out_unlock;
++	}
++	if (status & (STS_HCE | STS_FATAL)) {
++		xhci_warn(xhci, "Salina host error, halting controller\n");
++		xhci_halt(xhci);
 +		resched = false;
 +		goto out_unlock;
 +	}
@@ -9457,7 +9471,7 @@ index 1cbefee3c..827d7ea21 100644
  
  static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
  			 u32 field1, u32 field2,
-@@ -3083,7 +3084,7 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
+@@ -3083,12 +3084,14 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
   * Handle all OS-owned events on an interrupter event ring. It may drop
   * and reaquire xhci->lock between event processing.
   */
@@ -9466,6 +9480,30 @@ index 1cbefee3c..827d7ea21 100644
  			      bool skip_events)
  {
  	int event_loop = 0;
+ 	int err = 0;
+ 	u64 temp;
++	int salina_iters = 0;
++	const int salina_max_iters = 32;
+ 
+ 	xhci_clear_interrupt_pending(ir);
+ 
+@@ -3131,6 +3133,16 @@ int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
+ 
+ 		if (err)
+ 			break;
++
++		if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
++			if (++salina_iters > salina_max_iters) {
++				xhci_warn(xhci,
++					  "Salina event ring stuck after %d TRBs\n",
++					  salina_iters);
++				err = -EIO;
++				break;
++			}
++		}
+ 	}
+ 
+ 	xhci_update_erst_dequeue(xhci, ir, true);
 diff --git a/drivers/usb/host/xhci-ring.h b/drivers/usb/host/xhci-ring.h
 new file mode 100644
 index 000000000000..111111111111
