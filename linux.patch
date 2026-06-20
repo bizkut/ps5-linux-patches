@@ -8885,7 +8885,7 @@ new file mode 100644
 index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.c
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,550 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Sony PlayStation 5 Salina xHCI glue and PHY setup.
