@@ -27,11 +27,11 @@ on:
         type: boolean
       mwifiex_ref:
         description: 'ps5-linux-mwifiex branch/tag/SHA'
-        default: 'main'
+        default: 'linux-7.1.y'
         type: string
       mwifiex_nxp_ref:
         description: 'nxp-imx/mwifiex branch/tag/SHA'
-        default: 'lf-6.18.2_1.0.0'
+        default: 'lf-6.18.20_2.0.0'
         type: string
   workflow_call:
     inputs:
@@ -52,10 +52,10 @@ on:
         default: false
       mwifiex_ref:
         type: string
-        default: 'main'
+        default: 'linux-7.1.y'
       mwifiex_nxp_ref:
         type: string
-        default: 'lf-6.18.2_1.0.0'
+        default: 'lf-6.18.20_2.0.0'
 jobs:
   build:
     runs-on: self-hosted
@@ -89,8 +89,8 @@ jobs:
           PATCHES_REF="${{ inputs.patches_ref || '' }}"
           KERNEL_REF="${{ inputs.kernel_ref || 'linux-7.1.y' }}"
           MWIFIEX="${{ inputs.mwifiex || false }}"
-          MWIFIEX_REF="${{ inputs.mwifiex_ref || 'main' }}"
-          MWIFIEX_NXP_REF="${{ inputs.mwifiex_nxp_ref || 'lf-6.18.2_1.0.0' }}"
+          MWIFIEX_REF="${{ inputs.mwifiex_ref || 'linux-7.1.y' }}"
+          MWIFIEX_NXP_REF="${{ inputs.mwifiex_nxp_ref || 'lf-6.18.20_2.0.0' }}"
           extra_args=()
           if [ "$MWIFIEX" = "true" ]; then
             extra_args+=(--mwifiex --mwifiex-ref "$MWIFIEX_REF" --mwifiex-nxp-ref "$MWIFIEX_NXP_REF")
