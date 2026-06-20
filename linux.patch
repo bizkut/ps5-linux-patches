@@ -8885,7 +8885,7 @@ new file mode 100644
 index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.c
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,536 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Sony PlayStation 5 Salina xHCI glue and PHY setup.
@@ -9336,6 +9336,11 @@ index 000000000000..111111111111
 +
 +err_unmap:
 +	salina_unmap_bars();
++	if (ret == -ETIMEDOUT) {
++		dev_warn(&pdev->dev, "Salina xHCI PHY not ready, deferring\n");
++		return -EPROBE_DEFER;
++	}
++	dev_err(&pdev->dev, "Salina xHCI PHY init failed: %d\n", ret);
 +	return ret;
 +}
 +
@@ -9583,6 +9588,15 @@ diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
 index 2b0796f6d..bd87b8561 100644
 --- a/drivers/usb/host/xhci.h
 +++ b/drivers/usb/host/xhci.h
+@@ -1461,7 +1461,7 @@ struct xhci_interrupter {
+  * It can take up to 20 ms to transition from RExit to U0 on the
+  * Intel Lynx Point LP xHCI host.
+  */
+-#define	XHCI_MAX_REXIT_TIMEOUT_MS	20
++#define	XHCI_MAX_REXIT_TIMEOUT_MS	5000
+ struct xhci_port_cap {
+ 	u32			*psi;	/* array of protocol speed ID entries */
+ 	u8			psi_count;
 @@ -1644,6 +1644,7 @@ struct xhci_hcd {
  #define XHCI_CDNS_SCTX_QUIRK	BIT_ULL(48)
  #define XHCI_ETRON_HOST	BIT_ULL(49)
