@@ -184,7 +184,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
+          name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.ts }}-${{ steps.version.outputs.psha }}
           path: |
             image/release-bin/*.deb
             image/release-bin/*.pkg.tar.zst
@@ -207,8 +207,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
-          name: Kernel ${{ steps.version.outputs.kver }} (${{ steps.version.outputs.psha }})
+          tag_name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.ts }}-${{ steps.version.outputs.psha }}
+          name: Kernel ${{ steps.version.outputs.kver }} ${{ steps.version.outputs.ts }} (${{ steps.version.outputs.psha }})
           body: |
             PS5 Linux kernel packages for **${{ steps.version.outputs.kver }}**.
 
