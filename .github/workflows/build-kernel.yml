@@ -100,7 +100,7 @@ jobs:
 
             if [ ! -d "$KERNEL_SRC_DIR/.git" ]; then
               rm -rf "$KERNEL_SRC_DIR"
-              git clone --branch v7.1.1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_SRC_DIR"
+              git clone --branch v7.1.1 --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_SRC_DIR"
             fi
 
             git -C image/work/ps5-linux-patches init
