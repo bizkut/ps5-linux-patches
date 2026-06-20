@@ -64,24 +64,50 @@ jobs:
           echo "psha=$psha" >> "$GITHUB_OUTPUT"
           echo "ts=$ts" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          kver="${{ steps.version.outputs.kver }}"
+          psha="${{ steps.version.outputs.psha }}"
+          release_dir=image/release-bin
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+
+          for f in image/linux-bin/*.deb; do
+            base=$(basename "$f")
+            arch=${base##*_}
+            cp "$f" "$release_dir/linux-ps5_${kver}-${psha}_${arch}"
+          done
+
+          for f in image/linux-bin/*.pkg.tar.zst; do
+            base=$(basename "$f" .pkg.tar.zst)
+            cp "$f" "$release_dir/${base}-${psha}.pkg.tar.zst"
+          done
+
+          for f in image/linux-bin/*.rpm; do
+            base=$(basename "$f" .rpm)
+            cp "$f" "$release_dir/${base}-${psha}.rpm"
+          done
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
           name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
           path: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
-            image/linux-bin/*.rpm
+            image/release-bin/*.deb
+            image/release-bin/*.pkg.tar.zst
+            image/release-bin/*.rpm
           retention-days: 7
 
       - name: Compute checksums
         id: sha
         run: |
           shopt -s nullglob
-          files=(image/linux-bin/*.deb image/linux-bin/*.pkg.tar.zst image/linux-bin/*.rpm)
+          files=(image/release-bin/*.deb image/release-bin/*.pkg.tar.zst image/release-bin/*.rpm)
           {
             echo 'sums<<SHAEOF'
-            sha256sum "${files[@]}" | sed 's|image/linux-bin/||'
+            sha256sum "${files[@]}" | sed 's|image/release-bin/||'
             echo 'SHAEOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -103,7 +129,7 @@ jobs:
             ${{ steps.sha.outputs.sums }}
             ```
           files: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
-            image/linux-bin/*.rpm
+            image/release-bin/*.deb
+            image/release-bin/*.pkg.tar.zst
+            image/release-bin/*.rpm
           make_latest: true
