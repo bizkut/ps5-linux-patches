@@ -58,14 +58,16 @@ jobs:
 
     env:
       CCACHE_DIR: /home/bizkut/ccache
+      KERNEL_SRC_DIR: /home/bizkut/kernel-src/linux-v7.1.1-ps5
+      KERNEL_SRC_LOCK: /home/bizkut/kernel-src/linux-v7.1.1-ps5.lock
 
     steps:
       - name: Prepare self-hosted workspace
         run: |
           set -euo pipefail
-          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" 2>/dev/null || true
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")" 2>/dev/null || true
           rm -rf "$GITHUB_WORKSPACE/image"
-          mkdir -p "$CCACHE_DIR"
+          mkdir -p "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")"
 
       - name: Checkout image builder
         uses: actions/checkout@v6
@@ -76,6 +78,7 @@ jobs:
 
       - name: Build kernel
         run: |
+          set -euo pipefail
           FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
           PATCHES_REF="${{ inputs.patches_ref || '' }}"
           MWIFIEX="${{ inputs.mwifiex || false }}"
@@ -85,10 +88,45 @@ jobs:
           if [ "$MWIFIEX" = "true" ]; then
             extra_args+=(--mwifiex --mwifiex-ref "$MWIFIEX_REF" --mwifiex-nxp-ref "$MWIFIEX_NXP_REF")
           fi
-          bash image/build_image.sh --kernel-only \
-            --distro "$FORMAT" \
-            --patches-ref "$PATCHES_REF" \
-            "${extra_args[@]}"
+
+          if [ -z "$PATCHES_REF" ]; then
+            PATCHES_REF="bluetooth-fix"
+          fi
+
+          mkdir -p "$(dirname "$KERNEL_SRC_DIR")" image/work/ps5-linux-patches
+          {
+            flock 9
+            set -euo pipefail
+
+            if [ ! -d "$KERNEL_SRC_DIR/.git" ]; then
+              rm -rf "$KERNEL_SRC_DIR"
+              git clone --branch v7.1.1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_SRC_DIR"
+            fi
+
+            git -C image/work/ps5-linux-patches init
+            git -C image/work/ps5-linux-patches remote remove origin 2>/dev/null || true
+            git -C image/work/ps5-linux-patches remote add origin https://github.com/bizkut/ps5-linux-patches.git
+            git -C image/work/ps5-linux-patches fetch --depth 1 origin "$PATCHES_REF" || git -C image/work/ps5-linux-patches fetch origin "$PATCHES_REF"
+            git -C image/work/ps5-linux-patches reset --hard FETCH_HEAD
+
+            git -C "$KERNEL_SRC_DIR" fetch origin v7.1.1
+            git -C "$KERNEL_SRC_DIR" reset --hard FETCH_HEAD
+            git -C "$KERNEL_SRC_DIR" clean -fdx
+
+            shopt -s nullglob
+            patches=(image/work/ps5-linux-patches/*.patch)
+            [ ${#patches[@]} -eq 0 ] && { echo "No .patch files found in image/work/ps5-linux-patches"; exit 1; }
+            for p in "${patches[@]}"; do
+              echo "Applying $p"
+              git -C "$KERNEL_SRC_DIR" apply --exclude=Makefile "$GITHUB_WORKSPACE/$p"
+            done
+            cp image/work/ps5-linux-patches/.config "$KERNEL_SRC_DIR/.config"
+
+            bash image/build_image.sh --kernel-only \
+              --kernel "$KERNEL_SRC_DIR" \
+              --distro "$FORMAT" \
+              "${extra_args[@]}"
+          } 9>"$KERNEL_SRC_LOCK"
 
       - name: Build RPM package for all format
         run: |
@@ -190,4 +228,4 @@ jobs:
       - name: Restore workspace ownership
         if: always()
         run: |
-          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" 2>/dev/null || true
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")" 2>/dev/null || true
