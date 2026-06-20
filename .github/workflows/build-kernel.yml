@@ -54,6 +54,23 @@ jobs:
             --distro "$FORMAT" \
             --patches-ref "$PATCHES_REF"
 
+      - name: Build RPM package for all format
+        run: |
+          set -euo pipefail
+          FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
+          if [ "$FORMAT" != "all" ]; then
+            exit 0
+          fi
+          if compgen -G "image/linux-bin/*.rpm" > /dev/null; then
+            exit 0
+          fi
+
+          docker build -t ps5-kernel-packager-rpm \
+            -f image/docker/kernel-builder-rpm/Dockerfile image
+          docker run --rm --name "ps5-kernel-packager-rpm-${GITHUB_RUN_ID}" \
+            -v "$PWD/image/linux-bin":/out \
+            ps5-kernel-packager-rpm
+
       - name: Read kernel and patches version
         id: version
         run: |
