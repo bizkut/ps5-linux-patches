@@ -1,0 +1,163 @@
+name: Publish APT Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (latest = newest release)'
+        default: 'latest'
+        type: string
+      suite:
+        description: 'APT suite/codename'
+        default: 'stable'
+        type: string
+      component:
+        description: 'APT component'
+        default: 'main'
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        default: 'latest'
+      suite:
+        type: string
+        default: 'stable'
+      component:
+        type: string
+        default: 'main'
+    secrets:
+      APT_GPG_PRIVATE_KEY:
+        required: true
+      APT_GPG_PASSPHRASE:
+        required: false
+
+concurrency:
+  group: apt-repo
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
+      APT_SUITE: ${{ inputs.suite || 'stable' }}
+      APT_COMPONENT: ${{ inputs.component || 'main' }}
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+      APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+
+    steps:
+      - name: Install APT repository tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev gnupg
+
+      - name: Download Debian package from release
+        run: |
+          set -euo pipefail
+          mkdir -p debs
+
+          if ! printf '%s' "$APT_SUITE" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "Invalid APT suite: $APT_SUITE" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$APT_COMPONENT" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "Invalid APT component: $APT_COMPONENT" >&2
+            exit 1
+          fi
+
+          if [ "$RELEASE_TAG" = "latest" ]; then
+            RELEASE_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+
+          echo "Publishing Debian packages from release: $RELEASE_TAG"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.deb' \
+            --dir debs
+
+          test -n "$(find debs -maxdepth 1 -name '*.deb' -print -quit)"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+
+      - name: Checkout or create gh-pages branch
+        run: |
+          set -euo pipefail
+          mkdir -p apt-repo
+          git -C apt-repo init
+          git -C apt-repo remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git -C apt-repo ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git -C apt-repo fetch --depth 1 origin gh-pages
+            git -C apt-repo checkout -B gh-pages FETCH_HEAD
+          else
+            git -C apt-repo checkout --orphan gh-pages
+          fi
+
+      - name: Publish APT metadata
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "Missing APT_GPG_PRIVATE_KEY secret. Create a GPG signing key and store the private key in repository secrets." >&2
+            exit 1
+          fi
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')
+          if [ -z "$fpr" ]; then
+            echo "No GPG secret key was imported." >&2
+            exit 1
+          fi
+
+          cd apt-repo
+          mkdir -p "pool/main/l/linux-ps5"
+          mkdir -p "dists/$APT_SUITE/$APT_COMPONENT/binary-amd64"
+          cp ../debs/*.deb "pool/main/l/linux-ps5/"
+
+          dpkg-scanpackages --arch amd64 --multiversion pool \
+            > "dists/$APT_SUITE/$APT_COMPONENT/binary-amd64/Packages"
+          gzip -kf "dists/$APT_SUITE/$APT_COMPONENT/binary-amd64/Packages"
+
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin='PS5 Linux' \
+            -o APT::FTPArchive::Release::Label='PS5 Linux' \
+            -o APT::FTPArchive::Release::Suite="$APT_SUITE" \
+            -o APT::FTPArchive::Release::Codename="$APT_SUITE" \
+            -o APT::FTPArchive::Release::Architectures='amd64' \
+            -o APT::FTPArchive::Release::Components="$APT_COMPONENT" \
+            -o APT::FTPArchive::Release::Description='PS5 Linux kernel packages' \
+            release "dists/$APT_SUITE" > "dists/$APT_SUITE/Release"
+
+          gpg_args=(--batch --yes --pinentry-mode loopback --local-user "$fpr")
+          if [ -n "$APT_GPG_PASSPHRASE" ]; then
+            gpg_args+=(--passphrase "$APT_GPG_PASSPHRASE")
+          fi
+
+          gpg "${gpg_args[@]}" --clearsign \
+            -o "dists/$APT_SUITE/InRelease" \
+            "dists/$APT_SUITE/Release"
+          gpg "${gpg_args[@]}" -abs \
+            -o "dists/$APT_SUITE/Release.gpg" \
+            "dists/$APT_SUITE/Release"
+
+          gpg --batch --yes --export "$fpr" > KEY.gpg
+          gpg --batch --yes --armor --export "$fpr" > KEY.asc
+
+      - name: Commit APT repository
+        run: |
+          set -euo pipefail
+          cd apt-repo
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m "apt: publish $RELEASE_TAG" || exit 0
+          git push origin gh-pages
