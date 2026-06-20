@@ -39,6 +39,13 @@ jobs:
       CCACHE_DIR: /home/bizkut/ccache
 
     steps:
+      - name: Prepare self-hosted workspace
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" 2>/dev/null || true
+          rm -rf "$GITHUB_WORKSPACE/image"
+          mkdir -p "$CCACHE_DIR"
+
       - name: Checkout image builder
         uses: actions/checkout@v6
         with:
@@ -150,3 +157,8 @@ jobs:
             image/release-bin/*.pkg.tar.zst
             image/release-bin/*.rpm
           make_latest: true
+
+      - name: Restore workspace ownership
+        if: always()
+        run: |
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" 2>/dev/null || true
