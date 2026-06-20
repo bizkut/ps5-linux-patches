@@ -9909,7 +9909,7 @@ index 5c535f3ab..a4b587ad8 100644
  	ifnum_base = intf->cur_altsetting->desc.bInterfaceNumber;
  
  	if (!id->driver_info) {
-@@ -4048,6 +4060,15 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4048,6 +4060,19 @@ static int btusb_probe(struct usb_interface *intf,
  			id = match;
  	}
  
@@ -9918,6 +9918,10 @@ index 5c535f3ab..a4b587ad8 100644
 +	    intf->cur_altsetting->desc.bInterfaceNumber != 2)
 +		return -ENODEV;
 +
++	/* Devices matched with BTUSB_IFNUM_0 still may show btusb on an
++	 * isochronous companion interface claimed by the primary HCI device;
++	 * that is not a second HCI controller.
++	 */
 +	if ((id->driver_info & BTUSB_IFNUM_0) &&
 +	    intf->cur_altsetting->desc.bInterfaceNumber != 0)
 +		return -ENODEV;
