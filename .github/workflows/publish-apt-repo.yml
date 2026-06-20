@@ -82,7 +82,10 @@ jobs:
             --pattern '*.deb' \
             --dir debs
 
-          test -n "$(find debs -maxdepth 1 -name '*.deb' -print -quit)"
+          if [ -z "$(find debs -maxdepth 1 -name '*.deb' -print -quit)" ]; then
+            echo "No .deb assets found in release: $RELEASE_TAG" >&2
+            exit 1
+          fi
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
 
       - name: Checkout or create gh-pages branch
@@ -119,9 +122,10 @@ jobs:
           fi
 
           cd apt-repo
-          mkdir -p "pool/main/l/linux-ps5"
+          mkdir -p "pool/$APT_COMPONENT/l/linux-ps5"
           mkdir -p "dists/$APT_SUITE/$APT_COMPONENT/binary-amd64"
-          cp ../debs/*.deb "pool/main/l/linux-ps5/"
+          cp ../debs/*.deb "pool/$APT_COMPONENT/l/linux-ps5/"
+          touch .nojekyll
 
           dpkg-scanpackages --arch amd64 --multiversion pool \
             > "dists/$APT_SUITE/$APT_COMPONENT/binary-amd64/Packages"
