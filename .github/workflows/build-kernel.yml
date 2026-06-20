@@ -136,8 +136,10 @@ jobs:
               git -C "$KERNEL_SRC_DIR" apply --exclude=Makefile "$GITHUB_WORKSPACE/$p"
             done
             cp image/work/ps5-linux-patches/.config "$KERNEL_SRC_DIR/.config"
+            psha=$(git -C image/work/ps5-linux-patches rev-parse --short HEAD)
+            kernel_package_revision="${GITHUB_RUN_NUMBER}+g.${psha}"
 
-            bash image/build_image.sh --kernel-only \
+            KERNEL_PACKAGE_REVISION="$kernel_package_revision" bash image/build_image.sh --kernel-only \
               --kernel "$KERNEL_SRC_DIR" \
               --distro "$FORMAT" \
               "${extra_args[@]}"
@@ -166,11 +168,13 @@ jobs:
           psha=$(git -C image/work/ps5-linux-patches rev-parse --short HEAD)
           kver=$(cat image/linux-bin/VERSION)
           ts=$(date -u +%Y%m%d-%H%M%S)
-          rev=$(printf "%06d" "$GITHUB_RUN_NUMBER")
+          rev="$GITHUB_RUN_NUMBER"
           release_ver="${kver}-${rev}"
+          package_ver="${release_ver}+g.${psha}"
           echo "kver=$kver" >> "$GITHUB_OUTPUT"
           echo "kernel_ref=${{ inputs.kernel_ref || 'linux-7.1.y' }}" >> "$GITHUB_OUTPUT"
           echo "release_ver=$release_ver" >> "$GITHUB_OUTPUT"
+          echo "package_ver=$package_ver" >> "$GITHUB_OUTPUT"
           echo "psha=$psha" >> "$GITHUB_OUTPUT"
           echo "ts=$ts" >> "$GITHUB_OUTPUT"
 
@@ -179,6 +183,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           release_ver="${{ steps.version.outputs.release_ver }}"
+          package_ver="${{ steps.version.outputs.package_ver }}"
           psha="${{ steps.version.outputs.psha }}"
           release_dir=image/release-bin
           rm -rf "$release_dir"
@@ -187,7 +192,7 @@ jobs:
           for f in image/linux-bin/*.deb; do
             base=$(basename "$f")
             arch=${base##*_}
-            cp "$f" "$release_dir/linux-ps5_${release_ver}-${psha}_${arch}"
+            cp "$f" "$release_dir/linux-ps5_${package_ver}_${arch}"
           done
 
           for f in image/linux-bin/*.pkg.tar.zst; do
