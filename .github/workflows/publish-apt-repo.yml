@@ -1,3 +1,45 @@
+# Publish APT Repo workflow guide
+#
+# What this workflow does:
+# - Downloads linux-ps5_*.deb assets from a GitHub Release.
+# - Builds an apt repository under the gh-pages branch.
+# - Publishes apt metadata at:
+#   https://<owner>.github.io/<repo>/dists/<suite>/<component>/binary-amd64/
+# - Signs Release metadata and exports KEY.gpg/KEY.asc for users.
+#
+# One-time repository setup:
+# 1. Merge this workflow onto the repository default branch. GitHub only exposes
+#    workflow_dispatch workflows from the default branch.
+# 2. Enable GitHub Pages:
+#    Settings -> Pages -> Deploy from a branch -> gh-pages -> /root.
+# 3. Create a dedicated apt signing key on a trusted machine:
+#    gpg --quick-generate-key "PS5 Linux APT Repo <repo@example.invalid>" rsa4096 sign 0
+#    gpg --armor --export-secret-keys "PS5 Linux APT Repo" > apt-private.asc
+#    gpg --armor --export "PS5 Linux APT Repo" > apt-public.asc
+# 4. Add repository secrets:
+#    APT_GPG_PRIVATE_KEY = contents of apt-private.asc
+#    APT_GPG_PASSPHRASE = key passphrase, if the key has one
+#
+# Publishing:
+# - Run this workflow manually from Actions -> Publish APT Repo.
+# - release_tag = latest publishes the newest GitHub Release.
+# - suite defaults to stable, so users add "stable" in sources.list.
+# - component defaults to main, so users add "main" in sources.list.
+#
+# User install commands after the first publish:
+#   curl -fsSL https://<owner>.github.io/<repo>/KEY.gpg \
+#     | sudo gpg --dearmor -o /usr/share/keyrings/ps5-linux-archive-keyring.gpg
+#   echo "deb [arch=amd64 signed-by=/usr/share/keyrings/ps5-linux-archive-keyring.gpg] https://<owner>.github.io/<repo> stable main" \
+#     | sudo tee /etc/apt/sources.list.d/ps5-linux.list
+#   sudo apt update
+#   sudo apt install linux-ps5
+#
+# Notes:
+# - The .deb internal Version field must increase for apt upgrades. This repo's
+#   kernel workflow now emits versions like 7.1.1-21+g.666db64.
+# - dpkg-scanpackages --multiversion keeps older linux-ps5 package versions in
+#   the repo metadata, which is useful for manual downgrade testing.
+
 name: Publish APT Repo
 
 on:
