@@ -13,6 +13,10 @@ on:
         description: 'Patches branch/tag/SHA (empty = default)'
         default: ''
         type: string
+      kernel_ref:
+        description: 'Linux stable branch/tag/SHA'
+        default: 'linux-7.1.y'
+        type: string
       release_notes:
         description: 'Release notes'
         default: ''
@@ -37,6 +41,9 @@ on:
       patches_ref:
         type: string
         default: ''
+      kernel_ref:
+        type: string
+        default: 'linux-7.1.y'
       release_notes:
         type: string
         default: ''
@@ -58,16 +65,15 @@ jobs:
 
     env:
       CCACHE_DIR: /home/bizkut/ccache
-      KERNEL_SRC_DIR: /home/bizkut/kernel-src/linux-v7.1.1-ps5
-      KERNEL_SRC_LOCK: /home/bizkut/kernel-src/linux-v7.1.1-ps5.lock
+      KERNEL_SRC_ROOT: /home/bizkut/kernel-src
 
     steps:
       - name: Prepare self-hosted workspace
         run: |
           set -euo pipefail
-          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")" 2>/dev/null || true
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$KERNEL_SRC_ROOT" 2>/dev/null || true
           rm -rf "$GITHUB_WORKSPACE/image"
-          mkdir -p "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")"
+          mkdir -p "$CCACHE_DIR" "$KERNEL_SRC_ROOT"
 
       - name: Checkout image builder
         uses: actions/checkout@v6
@@ -81,6 +87,7 @@ jobs:
           set -euo pipefail
           FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
           PATCHES_REF="${{ inputs.patches_ref || '' }}"
+          KERNEL_REF="${{ inputs.kernel_ref || 'linux-7.1.y' }}"
           MWIFIEX="${{ inputs.mwifiex || false }}"
           MWIFIEX_REF="${{ inputs.mwifiex_ref || 'main' }}"
           MWIFIEX_NXP_REF="${{ inputs.mwifiex_nxp_ref || 'lf-6.18.2_1.0.0' }}"
@@ -93,15 +100,23 @@ jobs:
             PATCHES_REF="bluetooth-fix"
           fi
 
-          mkdir -p "$(dirname "$KERNEL_SRC_DIR")" image/work/ps5-linux-patches
+          KERNEL_SRC_SLUG=$(printf "%s" "$KERNEL_REF" | tr -c 'A-Za-z0-9._-' '-')
+          KERNEL_SRC_DIR="$KERNEL_SRC_ROOT/${KERNEL_SRC_SLUG}-ps5"
+          KERNEL_SRC_LOCK="$KERNEL_SRC_DIR.lock"
+
+          mkdir -p "$KERNEL_SRC_ROOT" image/work/ps5-linux-patches
           {
             flock 9
             set -euo pipefail
 
             if [ ! -d "$KERNEL_SRC_DIR/.git" ]; then
               rm -rf "$KERNEL_SRC_DIR"
-              git clone --branch v7.1.1 --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_SRC_DIR"
+              mkdir -p "$KERNEL_SRC_DIR"
+              git -C "$KERNEL_SRC_DIR" init
+              git -C "$KERNEL_SRC_DIR" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
             fi
+            git -C "$KERNEL_SRC_DIR" remote remove origin 2>/dev/null || true
+            git -C "$KERNEL_SRC_DIR" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 
             git -C image/work/ps5-linux-patches init
             git -C image/work/ps5-linux-patches remote remove origin 2>/dev/null || true
@@ -109,7 +124,7 @@ jobs:
             git -C image/work/ps5-linux-patches fetch --depth 1 origin "$PATCHES_REF" || git -C image/work/ps5-linux-patches fetch origin "$PATCHES_REF"
             git -C image/work/ps5-linux-patches reset --hard FETCH_HEAD
 
-            git -C "$KERNEL_SRC_DIR" fetch origin v7.1.1
+            git -C "$KERNEL_SRC_DIR" fetch --depth 1 origin "$KERNEL_REF" || git -C "$KERNEL_SRC_DIR" fetch origin "$KERNEL_REF"
             git -C "$KERNEL_SRC_DIR" reset --hard FETCH_HEAD
             git -C "$KERNEL_SRC_DIR" clean -fdx
 
@@ -154,6 +169,7 @@ jobs:
           rev=$(printf "%06d" "$GITHUB_RUN_NUMBER")
           release_ver="${kver}-${rev}"
           echo "kver=$kver" >> "$GITHUB_OUTPUT"
+          echo "kernel_ref=${{ inputs.kernel_ref || 'linux-7.1.y' }}" >> "$GITHUB_OUTPUT"
           echo "release_ver=$release_ver" >> "$GITHUB_OUTPUT"
           echo "psha=$psha" >> "$GITHUB_OUTPUT"
           echo "ts=$ts" >> "$GITHUB_OUTPUT"
@@ -217,6 +233,8 @@ jobs:
 
             ${{ inputs.release_notes }}
 
+            Kernel ref: `${{ steps.version.outputs.kernel_ref }}`
+
             Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/ps5-linux/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
 
             ```
@@ -231,4 +249,4 @@ jobs:
       - name: Restore workspace ownership
         if: always()
         run: |
-          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$(dirname "$KERNEL_SRC_DIR")" 2>/dev/null || true
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$KERNEL_SRC_ROOT" 2>/dev/null || true
