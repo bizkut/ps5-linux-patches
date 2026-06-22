@@ -240,7 +240,7 @@ jobs:
 
             Kernel ref: `${{ steps.version.outputs.kernel_ref }}`
 
-            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/ps5-linux/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
+            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/bizkut/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
 
             ```
             ${{ steps.sha.outputs.sums }}
