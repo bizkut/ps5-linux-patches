@@ -395,11 +395,17 @@ dmesg | grep "USBC"
 - `SET_REDRIVER_EQVAL` (msg_type 0x20) — may be needed for DP signal quality
 - `NOTIFY_SOC_WORKING` (msg_type 0x15) — may be needed at boot
 
-7. **AMD DC integration** — pending.
+7. **AMD DC integration** — done on `ps5-usbc-dp-alt-mode-k27` branch.
 
-- The AMD display patch currently uses HDMI-oriented `sceHdmi*` calls.
-- USB-C DP will need a separate DP path or AMD DC connector reprobe.
-- HPD from `GET_DEV_CONN_STATE` needs to trigger DRM hotplug.
+The current patch already routes DP streams through the same SCE retimer/redriver setup functions as HDMI. What was missing was hotplug detection, because the PS5 disables standard GPIO HPD and the USB-C PDCON reports plug events via ICC instead. The branch now adds:
+
+- A `delayed_work` in `amdgpu_dm.c` that polls `icc_usbc_get_dev_conn_state(0, ...)` every `amdgpu.ps5_usbc_dp_poll_ms` (default 2000 ms, 0 disables).
+- State tracking for `dp_alt` and `hpd`.
+- On any change, it iterates all DP connectors, runs `dc_link_detect(..., DETECT_REASON_HPD)`, calls `amdgpu_dm_update_connector_after_detect()`, and then fires `drm_kms_helper_hotplug_event()` so userspace re-probes the connector.
+- The work is initialized in `dm_hw_init()` and cancelled in `dm_hw_fini()`.
+- `amdgpu_dm_connector_mode_valid()` no longer applies the HDMI-only `isHdmiModeValid()` check to `DRM_MODE_CONNECTOR_DisplayPort` connectors.
+
+This is the minimal software-HPD bridge needed to make the AMD DC recognize a USB-C DP Alt Mode monitor as it is plugged and unplugged.
 
 ## Risks / Unknowns
 
@@ -425,7 +431,21 @@ ps5-usbc: PDCON op_mode=5
 ps5-usbc: conn=X dev=X vconn=X power=X mux=X orient=X dp_alt=X pin=X hpd=X
 ```
 
-Compare the results with the same boot using `spcie.usbc_pdcon_op_mode=4` and then `spcie.usbc_pdcon_op_mode=3`. The important fields are `dp_alt`, `pin`, and `hpd`:
+With the AMD DC software-HPD bridge in place, boot with a USB-C DP Alt Mode monitor attached and try each mode:
 
-- If **mode 3** produces `dp_alt=1`/`hpd=1`, then the PDCON mode alone is enough to negotiate DP Alt Mode and the next step is AMD DC integration.
+```sh
+spcie.usbc_pdcon_op_mode=3 amdgpu.ps5_usbc_dp_poll_ms=2000
+```
+
+The important fields are `dp_alt`, `pin`, and `hpd`:
+
+- If **mode 3** produces `dp_alt=1`/`hpd=1`, the AMD DC polling work should detect the change, run `dc_link_detect()` on the DP connector, and emit a DRM hotplug event. A second `card0-DP-*` connector should appear in `/sys/class/drm/` and the desktop environment should offer the second monitor.
 - If **mode 3** still shows `dp_alt=0`, then the PDCON needs additional setup calls (e.g. `SET_SUPPORTED_DEVICE_LIST` msg_type `0x19`, `SET_REDRIVER_EQVAL` msg_type `0x20`, or the DP capability query msg_type `0x01`) before it will negotiate a DP Alt Mode connection.
+- If `dp_alt=1`/`hpd=1` appears but no `card0-DP-*` connector is created, the VBIOS/DC is not exposing the USB-C lanes as a DP link. That would require a larger DC/VBIOS-level change, not just the HPD bridge.
+
+Useful commands to collect after boot:
+
+```sh
+dmesg | grep -E "USBC|DP Alt Mode|KMS|connector"
+ls /sys/class/drm/
+```
