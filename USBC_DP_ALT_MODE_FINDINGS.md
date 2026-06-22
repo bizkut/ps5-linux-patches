@@ -31,19 +31,25 @@ The missing part is PS5-specific USB-C/PD/DisplayPort Alt Mode firmware control.
 
 ```c
 int icc_usbc_set_pdcon_op_mode(u8 PortId, u8 OpMode);
+int icc_usbc_get_pdcon_op_mode(u8 PortId, u8 *op_mode);
 int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state);
 ```
 
-Earlier `ps5-usbc-dp2` exploration also recovered helpers for `get_pdcon_op_mode`, `notify_soc_working`, `notify_soc_download_standby`, and `set_auto_power_on_vr_headset`, but the current branch focuses on the minimal set needed to test operation modes and connection state.
+A module parameter `spcie.usbc_pdcon_op_mode` selects the mode at probe/init (default 5). The init code now logs both the requested mode and the mode actually reported by the PDCON, plus the full `GET_DEV_CONN_STATE` result. Earlier `ps5-usbc-dp2` exploration also recovered helpers for `notify_soc_working`, `notify_soc_download_standby`, and `set_auto_power_on_vr_headset`, but the current branch focuses on the minimal set needed to test operation modes and connection state.
 
-At SPCIE/ICC init, the patch selects USB-C PDCON mode 5, then queries and logs the connection state:
+At SPCIE/ICC init, the patch selects the configured USB-C PDCON mode, then verifies and logs the actual mode plus the connection state:
 
 ```c
 /* Select USB-C PDCON operation mode. */
 icc_usbc_set_pdcon_op_mode(0, ps5_usbc_pdcon_op_mode);
 
 {
+	u8 op_mode;
 	struct ps5_usbc_conn_state usbc_state;
+
+	if (!icc_usbc_get_pdcon_op_mode(0, &op_mode))
+		dev_info(&sdev->pdev->dev, "USBC PDCON op_mode=%u (requested=%u)\n",
+			 op_mode, ps5_usbc_pdcon_op_mode);
 
 	if (!icc_usbc_get_dev_conn_state(0, &usbc_state))
 		dev_info(&sdev->pdev->dev,
@@ -335,7 +341,7 @@ Sony's 5.50 kernel has a complete enough USBC module to expose `DpAlt`, `PinAssi
 
 ## Implementation Plan
 
-1. **Add Linux helpers** — done on `ps5-usbc-dp2` branch.
+1. **Add Linux helpers** — done on `ps5-usbc-dp-alt-mode-k27` branch.
 
 ```c
 struct ps5_usbc_conn_state {
@@ -350,26 +356,24 @@ struct ps5_usbc_conn_state {
 	u8 hpd;
 };
 
-int icc_usbc_get_pdcon_op_mode(u8 port_id, u8 *op_mode);
-int icc_usbc_get_dev_conn_state(u8 port_id, struct ps5_usbc_conn_state *state);
-int icc_usbc_notify_soc_working(u8 port_id);
-int icc_usbc_notify_soc_download_standby(u8 port_id);
-int icc_usbc_set_auto_power_on_vr_headset(u8 port_id, u8 enable);
+int icc_usbc_set_pdcon_op_mode(u8 PortId, u8 OpMode);
+int icc_usbc_get_pdcon_op_mode(u8 PortId, u8 *op_mode);
+int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state);
 ```
 
-2. **Implement using recovered ICC layouts** — done on `ps5-usbc-dp2` branch.
+2. **Implement using recovered ICC layouts** — done on `ps5-usbc-dp-alt-mode-k27` branch.
 
 All functions use `icc_query(buf, buf)` with `service_id = 0x12` and the msg_types recovered from firmware disassembly. Reply fields are read from `msg->data[]` at the firmware-verified offsets.
 
-3. **Add debug logging at SPCIE init** — done on `ps5-usbc-dp2` branch.
+3. **Add debug logging at SPCIE init** — done on `ps5-usbc-dp-alt-mode-k27` branch.
 
-After `icc_usbc_set_pdcon_op_mode(0, 5)`, the init now queries and logs:
-- `GET_PDCON_OP_MODE` result (verifies the mode was accepted)
+After `icc_usbc_set_pdcon_op_mode(0, ps5_usbc_pdcon_op_mode)`, the init now queries and logs:
+- `GET_PDCON_OP_MODE` result (verifies the mode was accepted by the PDCON)
 - `GET_DEV_CONN_STATE` result (all 9 fields, matching Sony's log format)
 
-The log output uses `pr_info("ps5-usbc: ...")` and can be filtered with:
+The log output uses `dev_info(&sdev->pdev->dev, "USBC ...")` and can be filtered with:
 ```sh
-dmesg | grep "ps5-usbc"
+dmesg | grep "USBC"
 ```
 
 4. **Test PDCON modes on hardware** — pending.
