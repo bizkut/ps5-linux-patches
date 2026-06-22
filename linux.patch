@@ -7280,7 +7280,7 @@ new file mode 100644
 index 000000000000..e02c074ee0b1
 --- /dev/null
 +++ b/drivers/ps5/spcie.c
-@@ -0,0 +1,1149 @@
+@@ -0,0 +1,1198 @@
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 +
 +#include <linux/module.h>
@@ -7381,6 +7381,10 @@ index 000000000000..e02c074ee0b1
 +
 +static bool spcie_initialized = false;
 +static u32 spcie_chip_revision_id = 0;
++static u8 ps5_usbc_pdcon_op_mode = 5;
++module_param_named(usbc_pdcon_op_mode, ps5_usbc_pdcon_op_mode, byte, 0644);
++MODULE_PARM_DESC(usbc_pdcon_op_mode,
++	"PS5 USB-C PDCON operation mode (default: 5)");
 +
 +static const u8 indicator_white_dim[] = {
 +	0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x11,
@@ -7540,6 +7544,38 @@ index 000000000000..e02c074ee0b1
 +	return icc_query(buf, buf);
 +}
 +EXPORT_SYMBOL(icc_usbc_set_pdcon_op_mode);
++
++int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++	int ret;
++
++	if (!state)
++		return -EINVAL;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = 0x0c;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = PortId;
++
++	ret = icc_query(buf, buf);
++	if (ret)
++		return ret;
++
++	state->conn_state = msg->data[0];
++	state->dev_type = msg->data[1];
++	state->vconn_req = msg->data[2];
++	state->power = msg->data[3];
++	state->mux = msg->data[4];
++	state->orient = msg->data[5];
++	state->dp_alt = msg->data[6];
++	state->pin_assign = msg->data[7];
++	state->hpd = msg->data[8];
++
++	return 0;
++}
++EXPORT_SYMBOL(icc_usbc_get_dev_conn_state);
 +
 +int icc_configuration_set_cpu_info_bit(u8 *bit)
 +{
@@ -8118,8 +8154,21 @@ index 000000000000..e02c074ee0b1
 +	/* Set LED to white dim */
 +	icc_indicator_set_led_white(0);
 +
-+	/* Enable SuperSpeed-USB-C port */
-+	icc_usbc_set_pdcon_op_mode(0, 5);
++	/* Select USB-C PDCON operation mode. */
++	icc_usbc_set_pdcon_op_mode(0, ps5_usbc_pdcon_op_mode);
++
++	{
++		struct ps5_usbc_conn_state usbc_state;
++
++		if (!icc_usbc_get_dev_conn_state(0, &usbc_state))
++			dev_info(&sdev->pdev->dev,
++				 "USBC state: conn=%u dev=%u vconn=%u power=%u mux=%u orient=%u dp_alt=%u pin=%u hpd=%u\n",
++				 usbc_state.conn_state, usbc_state.dev_type,
++				 usbc_state.vconn_req, usbc_state.power,
++				 usbc_state.mux, usbc_state.orient,
++				 usbc_state.dp_alt, usbc_state.pin_assign,
++				 usbc_state.hpd);
++	}
 +
 +	/* Initialize HDMI */
 +	getHdmiConfiguration();
@@ -8969,7 +9018,7 @@ new file mode 100644
 index 000000000000..24adcd953ab3
 --- /dev/null
 +++ b/include/linux/ps5.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,108 @@
 +#ifndef _LINUX_PS5_H
 +#define _LINUX_PS5_H
 +
@@ -8988,6 +9037,18 @@ index 000000000000..24adcd953ab3
 +	u16 length;
 +	u16 checksum;
 +	u8 data[];
++};
++
++struct ps5_usbc_conn_state {
++	u8 conn_state;
++	u8 dev_type;
++	u8 vconn_req;
++	u8 power;
++	u8 mux;
++	u8 orient;
++	u8 dp_alt;
++	u8 pin_assign;
++	u8 hpd;
 +};
 +
 +enum icc_service_id {
@@ -9036,6 +9097,7 @@ index 000000000000..24adcd953ab3
 +int icc_nvs_read(u32 partition, u16 offset, u16 length, void *data);
 +
 +int icc_usbc_set_pdcon_op_mode(u8 PortId, u8 OpMode);
++int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state);
 +int icc_configuration_set_cpu_info_bit(u8 *bit);
 +int icc_configuration_clear_cpu_info_bit(void);
 +
