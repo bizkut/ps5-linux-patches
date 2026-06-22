@@ -7547,6 +7547,29 @@ index 000000000000..e02c074ee0b1
 +}
 +EXPORT_SYMBOL(icc_usbc_set_pdcon_op_mode);
 +
++int icc_usbc_get_pdcon_op_mode(u8 PortId, u8 *op_mode)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++	int ret;
++
++	if (!op_mode)
++		return -EINVAL;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = 0x11;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = PortId;
++
++	ret = icc_query(buf, buf);
++	if (ret)
++		return ret;
++
++	*op_mode = msg->data[2];
++	return 0;
++}
++EXPORT_SYMBOL(icc_usbc_get_pdcon_op_mode);
++
 +int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state)
 +{
 +	u8 buf[ICC_MSG_MAX_SIZE] = {};
@@ -8160,7 +8183,12 @@ index 000000000000..e02c074ee0b1
 +	icc_usbc_set_pdcon_op_mode(0, ps5_usbc_pdcon_op_mode);
 +
 +	{
++		u8 op_mode;
 +		struct ps5_usbc_conn_state usbc_state;
++
++		if (!icc_usbc_get_pdcon_op_mode(0, &op_mode))
++			dev_info(&sdev->pdev->dev, "USBC PDCON op_mode=%u (requested=%u)\n",
++				 op_mode, ps5_usbc_pdcon_op_mode);
 +
 +		if (!icc_usbc_get_dev_conn_state(0, &usbc_state))
 +			dev_info(&sdev->pdev->dev,
@@ -9099,6 +9127,7 @@ index 000000000000..24adcd953ab3
 +int icc_nvs_read(u32 partition, u16 offset, u16 length, void *data);
 +
 +int icc_usbc_set_pdcon_op_mode(u8 PortId, u8 OpMode);
++int icc_usbc_get_pdcon_op_mode(u8 PortId, u8 *op_mode);
 +int icc_usbc_get_dev_conn_state(u8 PortId, struct ps5_usbc_conn_state *state);
 +int icc_configuration_set_cpu_info_bit(u8 *bit);
 +int icc_configuration_clear_cpu_info_bit(void);
