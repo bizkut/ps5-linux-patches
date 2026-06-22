@@ -7734,15 +7734,15 @@ index 000000000..01877044a
 +	if (ret)
 +		return ret;
 +
-+	state->conn_state = msg->data[0];
-+	state->dev_type = msg->data[1];
-+	state->vconn_req = msg->data[2];
-+	state->power = msg->data[3];
-+	state->mux = msg->data[4];
-+	state->orient = msg->data[5];
-+	state->dp_alt = msg->data[6];
-+	state->pin_assign = msg->data[7];
-+	state->hpd = msg->data[8];
++	state->conn_state = msg->data[2];
++	state->dev_type = msg->data[3];
++	state->vconn_req = msg->data[4];
++	state->power = msg->data[5];
++	state->mux = msg->data[6];
++	state->orient = msg->data[7];
++	state->dp_alt = msg->data[8];
++	state->pin_assign = msg->data[9];
++	state->hpd = msg->data[10];
 +
 +	return 0;
 +}
