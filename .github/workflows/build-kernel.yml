@@ -8,16 +8,54 @@ on:
         description: 'Package format'
         default: 'all'
         type: choice
-        options: [deb, arch, all]
+        options: [deb, arch, rpm, all]
       patches_ref:
         description: 'Patches branch/tag/SHA (empty = default)'
         default: ''
         type: string
+      kernel_ref:
+        description: 'Linux stable branch/tag/SHA'
+        default: 'linux-7.1.y'
+        type: string
+      release_notes:
+        description: 'Release notes'
+        default: ''
+        type: string
+      mwifiex:
+        description: 'Build optional PS5 IW620 mwifiex modules'
+        default: false
+        type: boolean
+      mwifiex_ref:
+        description: 'ps5-linux-mwifiex branch/tag/SHA'
+        default: 'linux-7.1.y'
+        type: string
+      mwifiex_nxp_ref:
+        description: 'nxp-imx/mwifiex branch/tag/SHA'
+        default: 'lf-6.18.20_2.0.0'
+        type: string
   workflow_call:
     inputs:
+      format:
+        type: string
+        default: 'all'
       patches_ref:
         type: string
         default: ''
+      kernel_ref:
+        type: string
+        default: 'linux-7.1.y'
+      release_notes:
+        type: string
+        default: ''
+      mwifiex:
+        type: boolean
+        default: false
+      mwifiex_ref:
+        type: string
+        default: 'linux-7.1.y'
+      mwifiex_nxp_ref:
+        type: string
+        default: 'lf-6.18.20_2.0.0'
 jobs:
   build:
     runs-on: self-hosted
@@ -26,23 +64,103 @@ jobs:
       contents: write
 
     env:
-      CCACHE_DIR: /home/opc/ccache
+      CCACHE_DIR: /home/bizkut/ccache
+      KERNEL_SRC_ROOT: /home/bizkut/kernel-src
 
     steps:
+      - name: Prepare self-hosted workspace
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$KERNEL_SRC_ROOT" 2>/dev/null || true
+          rm -rf "$GITHUB_WORKSPACE/image"
+          mkdir -p "$CCACHE_DIR" "$KERNEL_SRC_ROOT"
+
       - name: Checkout image builder
         uses: actions/checkout@v6
         with:
-          repository: ps5-linux/ps5-linux-image
+          repository: bizkut/ps5-linux-image
           path: image
-          ref: main
+          ref: 7.1.1
 
       - name: Build kernel
         run: |
+          set -euo pipefail
           FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
           PATCHES_REF="${{ inputs.patches_ref || '' }}"
-          bash image/build_image.sh --kernel-only \
-            --distro "$FORMAT" \
-            --patches-ref "$PATCHES_REF"
+          KERNEL_REF="${{ inputs.kernel_ref || 'linux-7.1.y' }}"
+          MWIFIEX="${{ inputs.mwifiex || false }}"
+          MWIFIEX_REF="${{ inputs.mwifiex_ref || 'linux-7.1.y' }}"
+          MWIFIEX_NXP_REF="${{ inputs.mwifiex_nxp_ref || 'lf-6.18.20_2.0.0' }}"
+          extra_args=()
+          if [ "$MWIFIEX" = "true" ]; then
+            extra_args+=(--mwifiex --mwifiex-ref "$MWIFIEX_REF" --mwifiex-nxp-ref "$MWIFIEX_NXP_REF")
+          fi
+
+          if [ -z "$PATCHES_REF" ]; then
+            PATCHES_REF="bluetooth-fix"
+          fi
+
+          KERNEL_SRC_SLUG=$(printf "%s" "$KERNEL_REF" | tr -c 'A-Za-z0-9._-' '-')
+          KERNEL_SRC_DIR="$KERNEL_SRC_ROOT/${KERNEL_SRC_SLUG}-ps5"
+          KERNEL_SRC_LOCK="$KERNEL_SRC_DIR.lock"
+
+          mkdir -p "$KERNEL_SRC_ROOT" image/work/ps5-linux-patches
+          {
+            flock 9
+            set -euo pipefail
+
+            if [ ! -d "$KERNEL_SRC_DIR/.git" ]; then
+              rm -rf "$KERNEL_SRC_DIR"
+              mkdir -p "$KERNEL_SRC_DIR"
+              git -C "$KERNEL_SRC_DIR" init
+              git -C "$KERNEL_SRC_DIR" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            fi
+            git -C "$KERNEL_SRC_DIR" remote remove origin 2>/dev/null || true
+            git -C "$KERNEL_SRC_DIR" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+
+            git -C image/work/ps5-linux-patches init
+            git -C image/work/ps5-linux-patches remote remove origin 2>/dev/null || true
+            git -C image/work/ps5-linux-patches remote add origin https://github.com/bizkut/ps5-linux-patches.git
+            git -C image/work/ps5-linux-patches fetch --depth 1 origin "$PATCHES_REF" || git -C image/work/ps5-linux-patches fetch origin "$PATCHES_REF"
+            git -C image/work/ps5-linux-patches reset --hard FETCH_HEAD
+
+            git -C "$KERNEL_SRC_DIR" fetch --depth 1 origin "$KERNEL_REF" || git -C "$KERNEL_SRC_DIR" fetch origin "$KERNEL_REF"
+            git -C "$KERNEL_SRC_DIR" reset --hard FETCH_HEAD
+            git -C "$KERNEL_SRC_DIR" clean -fdx
+
+            shopt -s nullglob
+            patches=(image/work/ps5-linux-patches/*.patch)
+            [ ${#patches[@]} -eq 0 ] && { echo "No .patch files found in image/work/ps5-linux-patches"; exit 1; }
+            for p in "${patches[@]}"; do
+              echo "Applying $p"
+              git -C "$KERNEL_SRC_DIR" apply --exclude=Makefile "$GITHUB_WORKSPACE/$p"
+            done
+            cp image/work/ps5-linux-patches/.config "$KERNEL_SRC_DIR/.config"
+            psha=$(git -C image/work/ps5-linux-patches rev-parse --short HEAD)
+            kernel_package_revision="${GITHUB_RUN_NUMBER}+g.${psha}"
+
+            KERNEL_PACKAGE_REVISION="$kernel_package_revision" bash image/build_image.sh --kernel-only \
+              --kernel "$KERNEL_SRC_DIR" \
+              --distro "$FORMAT" \
+              "${extra_args[@]}"
+          } 9>"$KERNEL_SRC_LOCK"
+
+      - name: Build RPM package for all format
+        run: |
+          set -euo pipefail
+          FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
+          if [ "$FORMAT" != "all" ]; then
+            exit 0
+          fi
+          if compgen -G "image/linux-bin/*.rpm" > /dev/null; then
+            exit 0
+          fi
+
+          docker build -t ps5-kernel-packager-rpm \
+            -f image/docker/kernel-builder-rpm/Dockerfile image
+          docker run --rm --name "ps5-kernel-packager-rpm-${GITHUB_RUN_ID}" \
+            -v "$PWD/image/linux-bin":/out \
+            ps5-kernel-packager-rpm
 
       - name: Read kernel and patches version
         id: version
@@ -50,25 +168,61 @@ jobs:
           psha=$(git -C image/work/ps5-linux-patches rev-parse --short HEAD)
           kver=$(cat image/linux-bin/VERSION)
           ts=$(date -u +%Y%m%d-%H%M%S)
+          rev="$GITHUB_RUN_NUMBER"
+          release_ver="${kver}-${rev}"
+          package_ver="${release_ver}+g.${psha}"
           echo "kver=$kver" >> "$GITHUB_OUTPUT"
+          echo "kernel_ref=${{ inputs.kernel_ref || 'linux-7.1.y' }}" >> "$GITHUB_OUTPUT"
+          echo "release_ver=$release_ver" >> "$GITHUB_OUTPUT"
+          echo "package_ver=$package_ver" >> "$GITHUB_OUTPUT"
           echo "psha=$psha" >> "$GITHUB_OUTPUT"
           echo "ts=$ts" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          release_ver="${{ steps.version.outputs.release_ver }}"
+          package_ver="${{ steps.version.outputs.package_ver }}"
+          psha="${{ steps.version.outputs.psha }}"
+          release_dir=image/release-bin
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+
+          for f in image/linux-bin/*.deb; do
+            base=$(basename "$f")
+            arch=${base##*_}
+            cp "$f" "$release_dir/linux-ps5_${package_ver}_${arch}"
+          done
+
+          for f in image/linux-bin/*.pkg.tar.zst; do
+            base=$(basename "$f" .pkg.tar.zst)
+            cp "$f" "$release_dir/${base}-${psha}.pkg.tar.zst"
+          done
+
+          for f in image/linux-bin/*.rpm; do
+            base=$(basename "$f" .rpm)
+            cp "$f" "$release_dir/${base}-${psha}.rpm"
+          done
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
+          name: kernel-${{ steps.version.outputs.ts }}-${{ steps.version.outputs.release_ver }}-${{ steps.version.outputs.psha }}
           path: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
+            image/release-bin/*.deb
+            image/release-bin/*.pkg.tar.zst
+            image/release-bin/*.rpm
           retention-days: 7
 
       - name: Compute checksums
         id: sha
         run: |
+          shopt -s nullglob
+          files=(image/release-bin/*.deb image/release-bin/*.pkg.tar.zst image/release-bin/*.rpm)
           {
             echo 'sums<<SHAEOF'
-            sha256sum image/linux-bin/*.deb image/linux-bin/*.pkg.tar.zst | sed 's|image/linux-bin/||'
+            sha256sum "${files[@]}" | sed 's|image/release-bin/||'
             echo 'SHAEOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -77,17 +231,27 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
-          name: Kernel ${{ steps.version.outputs.kver }} (${{ steps.version.outputs.psha }})
+          tag_name: kernel-${{ steps.version.outputs.ts }}-${{ steps.version.outputs.release_ver }}-${{ steps.version.outputs.psha }}
+          name: Kernel ${{ steps.version.outputs.release_ver }} ${{ steps.version.outputs.ts }} (${{ steps.version.outputs.psha }})
           body: |
-            PS5 Linux kernel packages for **${{ steps.version.outputs.kver }}**.
+            PS5 Linux kernel packages for **${{ steps.version.outputs.release_ver }}**.
 
-            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/ps5-linux/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
+            ${{ inputs.release_notes }}
+
+            Kernel ref: `${{ steps.version.outputs.kernel_ref }}`
+
+            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/bizkut/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
 
             ```
             ${{ steps.sha.outputs.sums }}
             ```
           files: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
+            image/release-bin/*.deb
+            image/release-bin/*.pkg.tar.zst
+            image/release-bin/*.rpm
           make_latest: true
+
+      - name: Restore workspace ownership
+        if: always()
+        run: |
+          sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE" "$CCACHE_DIR" "$KERNEL_SRC_ROOT" 2>/dev/null || true
