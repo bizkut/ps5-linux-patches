@@ -7384,7 +7384,9 @@ index 000000000000..e02c074ee0b1
 +static u8 ps5_usbc_pdcon_op_mode = 5;
 +module_param_named(usbc_pdcon_op_mode, ps5_usbc_pdcon_op_mode, byte, 0644);
 +MODULE_PARM_DESC(usbc_pdcon_op_mode,
-+	"PS5 USB-C PDCON operation mode (default: 5)");
++	"PS5 USB-C PDCON operation mode (default: 5). "
++	"Firmware only accepts 3 (Vbus-disable / possible DP Alt Mode), "
++	"4 (pre-suspend), or 5 (USB 3.1).");
 +
 +static const u8 indicator_white_dim[] = {
 +	0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x11,
