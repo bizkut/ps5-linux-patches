@@ -9887,7 +9887,7 @@ diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
 index 5c535f3ab..a4b587ad8 100644
 --- a/drivers/bluetooth/btusb.c
 +++ b/drivers/bluetooth/btusb.c
-@@ -67,6 +67,10 @@ static struct usb_driver btusb_driver;
+@@ -67,6 +67,11 @@
  #define BTUSB_INTEL_NO_WBS_SUPPORT	BIT(26)
  #define BTUSB_ACTIONS_SEMI		BIT(27)
  #define BTUSB_BARROT			BIT(28)
@@ -9895,10 +9895,11 @@ index 5c535f3ab..a4b587ad8 100644
 +#define BTUSB_BROKEN_LE_DEFAULT_PHY	BIT(30)
 +#define BTUSB_BROKEN_READ_LOCAL_NAME	BIT(31)
 +#define BTUSB_NO_AUTOSUSPEND		BIT_ULL(32)
++#define BTUSB_BROKEN_LE_EXT_ADV		BIT_ULL(33)
  
  static const struct usb_device_id btusb_table[] = {
  	/* Generic Bluetooth USB device */
-@@ -80,5 +84,12 @@ static const struct usb_device_id btusb_table[] = {
+@@ -80,5 +84,13 @@
  	{ USB_DEVICE_INFO(0xe0, 0x01, 0x04), .driver_info = BTUSB_AMP },
  
 +	/* PS5 IW620 Bluetooth device */
@@ -9906,12 +9907,13 @@ index 5c535f3ab..a4b587ad8 100644
 +						     BTUSB_IFNUM_0 |
 +						     BTUSB_BROKEN_LE_DEFAULT_PHY |
 +						     BTUSB_BROKEN_READ_LOCAL_NAME |
-+						     BTUSB_NO_AUTOSUSPEND },
++						     BTUSB_NO_AUTOSUSPEND |
++						     BTUSB_BROKEN_LE_EXT_ADV },
 +
  	/* Generic Bluetooth USB interface */
  	{ USB_INTERFACE_INFO(0xe0, 0x01, 0x01) },
  
-@@ -472,6 +483,11 @@ static const struct usb_device_id quirks_table[] = {
+@@ -472,6 +483,12 @@
  	{ USB_DEVICE(0x1286, 0x2044), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x2046), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x204e), .driver_info = BTUSB_MARVELL },
@@ -9919,7 +9921,8 @@ index 5c535f3ab..a4b587ad8 100644
 +						     BTUSB_IFNUM_0 |
 +						     BTUSB_BROKEN_LE_DEFAULT_PHY |
 +						     BTUSB_BROKEN_READ_LOCAL_NAME |
-+						     BTUSB_NO_AUTOSUSPEND },
++						     BTUSB_NO_AUTOSUSPEND |
++						     BTUSB_BROKEN_LE_EXT_ADV },
  
  	/* Intel Bluetooth devices */
  	{ USB_DEVICE(0x8087, 0x0025), .driver_info = BTUSB_INTEL_COMBINED },
@@ -9955,7 +9958,7 @@ index 5c535f3ab..a4b587ad8 100644
  	if (id->driver_info == BTUSB_IGNORE)
  		return -ENODEV;
  
-@@ -4344,6 +4365,12 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4344,6 +4365,15 @@
  	if (id->driver_info & BTUSB_INVALID_LE_STATES)
  		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_STATES);
  
@@ -9964,6 +9967,9 @@ index 5c535f3ab..a4b587ad8 100644
 +
 +	if (id->driver_info & BTUSB_BROKEN_READ_LOCAL_NAME)
 +		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_LOCAL_NAME);
++
++	if (id->driver_info & BTUSB_BROKEN_LE_EXT_ADV)
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_EXT_ADV);
 +
  	if (id->driver_info & BTUSB_DIGIANSWER) {
  		data->cmdreq_type = USB_TYPE_VENDOR;
@@ -9981,7 +9987,7 @@ diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
 index 89ad9470f..64af42b3f 100644
 --- a/include/net/bluetooth/hci.h
 +++ b/include/net/bluetooth/hci.h
-@@ -309,6 +309,22 @@ enum {
+@@ -309,6 +309,31 @@
  	 */
  	HCI_QUIRK_BROKEN_SET_RPA_TIMEOUT,
  
@@ -10001,9 +10007,34 @@ index 89ad9470f..64af42b3f 100644
 +	 */
 +	HCI_QUIRK_BROKEN_READ_LOCAL_NAME,
 +
++	/* When this quirk is set, the HCI_LE_EXT_ADV feature bit is masked
++	 * out after reading local features. This is required for controllers
++	 * which advertise LE Extended Advertising support but time out on
++	 * HCI_OP_LE_SET_EXT_ADV_ENABLE.
++	 *
++	 * This quirk can be set before hci_register_dev is called.
++	 */
++	HCI_QUIRK_BROKEN_LE_EXT_ADV,
++
  	/*
  	 * When this quirk is set, the HCI_OP_LE_EXT_CREATE_CONN command is
  	 * disabled. This is required for the Actions Semiconductor ATS2851
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index 66052d6aaa1d..4d5ace9d245d9 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -1236,7 +1236,11 @@
+ 		return rp->status;
+ 
+ 	memcpy(hdev->le_features, rp->features, 8);
++	if (hci_test_quirk(hdev, HCI_QUIRK_BROKEN_LE_EXT_ADV)) {
++		bt_dev_info(hdev, "masking LE Extended Advertising feature");
++		hdev->le_features[1] &= ~HCI_LE_EXT_ADV;
++	}
+ 
+ 	return rp->status;
+ }
+
 diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
 index 919ec275d..8d9e47d5c 100644
 --- a/net/bluetooth/hci_sync.c
