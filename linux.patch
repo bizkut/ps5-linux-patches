@@ -1094,69 +1094,68 @@ diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
 index 830fefb342c6..f13155f049c4 100644
 --- a/drivers/bluetooth/btusb.c
 +++ b/drivers/bluetooth/btusb.c
-@@ -67,6 +67,10 @@ static struct usb_driver btusb_driver;
+@@ -67,6 +67,9 @@ static struct usb_driver btusb_driver;
  #define BTUSB_INTEL_NO_WBS_SUPPORT	BIT(26)
  #define BTUSB_ACTIONS_SEMI		BIT(27)
  #define BTUSB_BARROT			BIT(28)
 +#define BTUSB_IFNUM_0                  BIT(29)
 +#define BTUSB_BROKEN_LE_DEFAULT_PHY    BIT(30)
-+#define BTUSB_BROKEN_READ_LOCAL_NAME   BIT(31)
-+#define BTUSB_NO_AUTOSUSPEND   		BIT(32)
++#define BTUSB_NO_AUTOSUSPEND           BIT(31)
  
  static const struct usb_device_id btusb_table[] = {
  	/* Generic Bluetooth USB device */
-@@ -172,6 +176,14 @@ static const struct usb_device_id btusb_table[] = {
- 	{ USB_DEVICE(0x8087, 0x0a5a),
- 	  .driver_info = BTUSB_INTEL_BOOT | BTUSB_BROKEN_ISOC },
- 
-+       /* PS5 IW620 Bluetooth device */
-+	{ USB_DEVICE(0x1286, 0x2059),
-+	  .driver_info = BTUSB_MARVELL |
-+					 BTUSB_IFNUM_0 |
-+					 BTUSB_BROKEN_LE_DEFAULT_PHY |
-+					 BTUSB_BROKEN_READ_LOCAL_NAME |
-+					 BTUSB_NO_AUTOSUSPEND },
-+
- 	{ }	/* Terminating entry */
- };
- 
-@@ -472,6 +484,11 @@ static const struct usb_device_id quirks_table[] = {
+@@ -472,6 +475,12 @@ static const struct usb_device_id quirks_table[] = {
  	{ USB_DEVICE(0x1286, 0x2044), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x2046), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x204e), .driver_info = BTUSB_MARVELL },
-+	{ USB_DEVICE(0x1286, 0x2059), .driver_info = BTUSB_MARVELL |
-+												 BTUSB_IFNUM_0 |
-+											 	 BTUSB_BROKEN_LE_DEFAULT_PHY |
-+											 	 BTUSB_BROKEN_READ_LOCAL_NAME |
-+											 	 BTUSB_NO_AUTOSUSPEND },
++	/* PlayStation 5 IW620 Bluetooth device */
++	{ USB_DEVICE(0x1286, 0x2059),
++	  .driver_info = BTUSB_MARVELL |
++			 BTUSB_IFNUM_0 |
++			 BTUSB_BROKEN_LE_DEFAULT_PHY |
++			 BTUSB_NO_AUTOSUSPEND },
  
  	/* Intel Bluetooth devices */
  	{ USB_DEVICE(0x8087, 0x0025), .driver_info = BTUSB_INTEL_COMBINED },
-@@ -4055,6 +4072,10 @@ static int btusb_probe(struct usb_interface *intf,
- 	    (intf->cur_altsetting->desc.bInterfaceNumber != 2))
- 		return -ENODEV;
+@@ -4055,11 +4060,6 @@ static int btusb_probe(struct usb_interface *intf,
  
-+	if ((id->driver_info & BTUSB_IFNUM_0) &&
-+		intf->cur_altsetting->desc.bInterfaceNumber != 0)
-+		return -ENODEV;
-+
+ 	BT_DBG("intf %p id %p", intf, id);
+ 
+-	if ((id->driver_info & BTUSB_IFNUM_2) &&
+-	    (intf->cur_altsetting->desc.bInterfaceNumber != 0) &&
+-	    (intf->cur_altsetting->desc.bInterfaceNumber != 2))
+-		return -ENODEV;
+-
  	ifnum_base = intf->cur_altsetting->desc.bInterfaceNumber;
  
  	if (!id->driver_info) {
-@@ -4344,6 +4365,12 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4075,6 +4075,15 @@ static int btusb_probe(struct usb_interface *intf,
+ 		if (match)
+ 			id = match;
+ 	}
++
++	if ((id->driver_info & BTUSB_IFNUM_2) &&
++	    (intf->cur_altsetting->desc.bInterfaceNumber != 0) &&
++	    (intf->cur_altsetting->desc.bInterfaceNumber != 2))
++		return -ENODEV;
++
++	if ((id->driver_info & BTUSB_IFNUM_0) &&
++	    intf->cur_altsetting->desc.bInterfaceNumber != 0)
++		return -ENODEV;
+ 
+ 	if (id->driver_info == BTUSB_IGNORE)
+ 		return -ENODEV;
+@@ -4344,6 +4353,9 @@ static int btusb_probe(struct usb_interface *intf,
  	if (id->driver_info & BTUSB_INVALID_LE_STATES)
  		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_STATES);
  
 +	if (id->driver_info & BTUSB_BROKEN_LE_DEFAULT_PHY)
 +		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_SET_DEFAULT_PHY);
 +
-+	if (id->driver_info & BTUSB_BROKEN_READ_LOCAL_NAME)
-+		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_LOCAL_NAME);
-+
  	if (id->driver_info & BTUSB_DIGIANSWER) {
  		data->cmdreq_type = USB_TYPE_VENDOR;
  		hci_set_quirk(hdev, HCI_QUIRK_RESET_ON_CLOSE);
-@@ -4400,7 +4427,7 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4400,7 +4412,7 @@ static int btusb_probe(struct usb_interface *intf,
  			data->diag = NULL;
  	}
  
@@ -9864,47 +9863,29 @@ index 000000000000..24adcd953ab3
 +
 +#endif /* _LINUX_PS5_H */
 diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
-index 572b1c620c5d..b776491a1241 100644
+index 572b1c620c5d..eadcb1e040d3 100644
 --- a/include/net/bluetooth/hci.h
 +++ b/include/net/bluetooth/hci.h
-@@ -309,6 +309,22 @@ enum {
+@@ -309,6 +309,14 @@ enum {
  	 */
  	HCI_QUIRK_BROKEN_SET_RPA_TIMEOUT,
  
 +	/* When this quirk is set, the HCI_OP_LE_SET_DEFAULT_PHY command is
-+	* skipped during initialization. This is required for controllers
-+	* which advertise the command but reject the default 1M PHY request.
-+	*
-+	* This quirk can be set before hci_register_dev is called.
-+	*/
++	 * skipped during initialization. This is required for controllers
++	 * which advertise the command but reject the default 1M PHY request.
++	 *
++	 * This quirk can be set before hci_register_dev is called.
++	 */
 +	HCI_QUIRK_BROKEN_SET_DEFAULT_PHY,
-+
-+	/* When this quirk is set, the HCI_OP_READ_LOCAL_NAME command is
-+	* skipped during initialization. This is required for controllers
-+	* which become unstable when queried for the local name.
-+	*
-+	* This quirk can be set before hci_register_dev is called.
-+	*/
-+	HCI_QUIRK_BROKEN_READ_LOCAL_NAME,
 +
  	/*
  	 * When this quirk is set, the HCI_OP_LE_EXT_CREATE_CONN command is
  	 * disabled. This is required for the Actions Semiconductor ATS2851
 diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
-index df23245d6ccd..1248c3735900 100644
+index df23245d6ccd..289cc0eb83d6 100644
 --- a/net/bluetooth/hci_sync.c
 +++ b/net/bluetooth/hci_sync.c
-@@ -3787,6 +3787,9 @@ static int hci_read_dev_class_sync(struct hci_dev *hdev)
- /* Read Local Name */
- static int hci_read_local_name_sync(struct hci_dev *hdev)
- {
-+	if (hci_test_quirk(hdev, HCI_QUIRK_BROKEN_READ_LOCAL_NAME))
-+		return 0;
-+
- 	return __hci_cmd_sync_status(hdev, HCI_OP_READ_LOCAL_NAME,
- 				     0, NULL, HCI_CMD_TIMEOUT);
- }
-@@ -4874,6 +4877,12 @@ static int hci_le_set_default_phy_sync(struct hci_dev *hdev)
+@@ -4874,6 +4874,12 @@ static int hci_le_set_default_phy_sync(struct hci_dev *hdev)
  {
  	struct hci_cp_le_set_default_phy cp;
  
