@@ -139,6 +139,126 @@ PS5: emulated_link_detect: EDID status=0                # No EDID
 - MP3 likely enables the display pipeline (scanout, HDCP) not the combo PHY
 - PHY configuration must be done in Linux kernel driver (acquire_phy)
 
+**Issue 10: PS5 firmware uses ICC for ALL display communication (CRITICAL)**
+- The PS5 firmware uses ICC (service_id=0x10, HDMI service) for ALL display
+  operations — both HDMI AND USB-C
+- EDID read, DDC read, DP link status, DP equalizer, HDCP — all via ICC
+- The GPU's AUX engines (AUX0/AUX1) are NOT used by the PS5 firmware
+- The south bridge (Belize/EMC) handles actual display communication
+- Linux uses standard AUX for HDMI (works via FLAVA3 IC) but AUX1 for
+  USB-C times out — the combo PHY may not route SBU to AUX1 at all
+- **Solution**: Implement ICC-based EDID read for USB-C, matching PS5 firmware
+
+## PS5 Firmware ICC Display Architecture (NEW)
+
+### Key Finding: ICC is Used for ALL Display Communication
+
+The PS5 firmware uses ICC (Inter-Chip Communication) to the south bridge
+(Belize/EMC) for ALL display operations. The GPU's AUX engines are NOT used.
+
+**HDMI ICC service (service_id=0x10)** handles:
+- `Read EDID Data` — EDID read via ICC
+- `Read DDC Data` — DDC/I2C read via ICC
+- `Get DP Link Status` — DP link status via ICC
+- `getDisplayPortEqualizerStatus` — DP equalizer via ICC
+- `Read DP Reset Status` — DP reset status via ICC
+- `Read Aksv` / `Get Aksv` — HDCP Aksv via ICC
+- `HotPlug Status` — HPD status via ICC
+- `Video Basic Config` / `Video Config` — video config via ICC
+- `Audio Config` / `Audio Basic Config` — audio config via ICC
+- `sceHdmiControlEncryption` — HDCP encryption via ICC
+- `sceHdmiTransmitCecSignal` — CEC via ICC
+- `Start EMC HDMI service` — EMC service start via ICC
+- `Ctrl HDCP` / `Stop HDCP HW` — HDCP control via ICC
+- `Hdmi OutputMode` — output mode via ICC
+- `LinkTraing Config` — link training config via ICC
+
+**USBC ICC service (service_id=0x12)** handles ONLY PD (power delivery):
+- `SET_PDCON_OP_MODE` / `GET_PDCON_OP_MODE` — PD controller op mode
+- `SET_OPT_PDP_ENABLE` — DP power delivery enable
+- `GET_DEV_CONN_STATE` — connection state (DpAlt, PinAssign, HPD, Mux)
+- `NOTIFY_SOC_WORKING` / `NOTIFY_SOC_DOWNLOAD_STANDBY` — SOC state
+- `SET_REDRIVER_EQVAL` — redriver equalizer
+- `SET_SUPPORTED_DEVICE_LIST` — supported device list
+- `GET_PDCON_IC_TYPE` / `GET_PDCON_FW_VER` — PD controller info
+- **NO EDID read command** — EDID is read via HDMI ICC service (0x10)
+
+### ICC EDID Read Function (Firmware Offset 0x0090fa90)
+
+The EDID read function takes parameter `edi`:
+- `edi=0`: HDMI (DP-1, FLAVA3 IC)
+- `edi=1`: USB-C (DP-2, PSVR2)
+
+Both use **service_id=0x10 (HDMI ICC service)** — the same service handles
+both displays. The south bridge routes the request to the correct display.
+
+**Step 1: Setup command** (ICC message, length=0x6c):
+```
+service_id = 0x10
+msg_type   = 0x0000
+length     = 0x006c (108 bytes)
+data[0]    = 4
+data[3]    = 9
+data[1:2]  = 0x0060
+... (many configuration bytes for display pipeline setup)
+```
+
+**Step 2: EDID read command** (ICC message, length=0x20):
+```
+service_id = 0x10
+msg_type   = 0x0000
+length     = 0x0020 (32 bytes, ICC_MSG_MIN_SIZE)
+data[0]    = 4     (EDID read command)
+data[1:2]  = 0x000c
+data[3]    = 1
+data[4]    = 1
+data[5]    = 8
+data[6]    = 1
+data[7]    = 1
+data[8]    = 1
+data[9]    = 0x7c  (I2C device address for EDID)
+data[10]   = 0x00
+```
+
+**Step 3: DDC read command** (separate function at 0x0090fdc0):
+```
+service_id = 0x10
+msg_type   = 0x0000
+length     = 0x0020
+data[0]    = 4     (DDC read command)
+data[1:2]  = 0x000c
+data[3]    = 1
+data[4]    = 1
+data[5]    = 8
+data[6]    = 1
+data[7]    = 1
+data[8]    = 1
+data[9]    = 0x60  (different I2C device address for DDC)
+data[10]   = 0x04
+```
+
+### Why HDMI AUX Works in Linux but USB-C AUX Doesn't
+
+- **HDMI (DP-1)**: The FLAVA3 IC provides a bridge between the GPU's AUX0/DDC
+  engine and the HDMI display. Linux uses AUX0 successfully. The PS5 firmware
+  uses ICC instead, but AUX0 works as an alternative path.
+
+- **USB-C (DP-2)**: The combo PHY may NOT physically route SBU1/SBU2 pins to
+  the GPU's AUX1 engine. Instead, SBU goes to the south bridge via ICC. No
+  amount of PHY register configuration will make AUX1 work if the hardware
+  doesn't route SBU to AUX1. AUX1 always times out because the AUX signal
+  never reaches the USB-C display.
+
+### Linux Solution: ICC-based EDID Read
+
+To read EDID from USB-C display in Linux:
+1. Send ICC message via spcie bus (service_id=0x10, msg_type=0, data[0]=4)
+2. The south bridge routes the EDID read to the USB-C display
+3. Receive EDID data in the ICC response
+4. Feed the EDID to the DRM subsystem
+
+This bypasses the AUX engine entirely and matches what the PS5 firmware does.
+
 ## Register State (Latest Boot)
 
 Combo PHY (RDPCSTX1) register dump from `acquire_phy`:
@@ -680,54 +800,53 @@ in `link_encoder.h` so they can be called from `amdgpu_dm.c`.
 
 ## Next Steps
 
-**STATUS** (2026-06-26): PHY reset/mode fix confirmed working (dm_write_reg).
-MP3 USB-C init added to loader (no PHY effect). SET_OPT_PDP_ENABLE added to
-USBC driver (not yet tested — needs kernel rebuild). AUX still TIMEOUT.
+**STATUS** (2026-06-26): AUX approach confirmed dead-end. PS5 firmware uses ICC
+for ALL display communication (both HDMI and USB-C). AUX1 times out because
+the combo PHY likely doesn't route SBU to AUX1. Need to implement ICC-based
+EDID read matching PS5 firmware behavior.
 
-### Immediate (needs kernel rebuild via GitHub Actions)
-1. **Test SET_OPT_PDP_ENABLE** — new ICC command (msg_type 0x12) added to USBC driver
+### Highest Priority: ICC-based EDID Read
+1. **Implement ICC EDID read in spcie/usbc driver**
+   - Send ICC message via spcie bus: service_id=0x10 (HDMI), msg_type=0, data[0]=4
+   - EDID read: data[9]=0x7c, data[10]=0x00, length=0x20
+   - May need setup command first (length=0x6c with display config)
+   - The south bridge routes the read to the USB-C display
+   - Feed EDID to DRM via `drm_edid_read_custom()` or similar
+
+2. **Test SET_OPT_PDP_ENABLE** — needs kernel rebuild
    - Rebuild kernel with updated `linux.patch`
-   - Check dmesg for `SET_OPT_PDP_ENABLE PortId(00) Enable(1)` and success/failure
+   - Check dmesg for `SET_OPT_PDP_ENABLE PortId(00) Enable(1)`
    - If it fails with port 0, try `modprobe usbc usbc_port_id=3`
 
-2. **Compare HDMI vs USB-C PHY registers** — full CNTL0-CNTL14 dump added
-   - New kernel will print `HDMI PHY CNTL0=... CNTL2=...` (RDPCSTX0, working)
-   - And `PHY CNTL0=... CNTL2=...` (RDPCSTX1, not working)
-   - Compare to identify which registers need different values
-   - Focus on CNTL3 (TX_CLK_RDY, TX_DATA_EN), CNTL5/CNTL11/CNTL12 (MPLL)
+3. **Compare HDMI vs USB-C PHY registers** — full CNTL0-CNTL14 dump added
+   - New kernel will print HDMI (RDPCSTX0) vs USB-C (RDPCSTX1) registers
+   - May reveal if there's a PHY routing config we're missing
 
 ### Medium priority
-3. **Port ID investigation**
+4. **Port ID investigation**
    - GET_DEV_CONN_STATE returns PortId=3 but commands send to PortId=0
    - PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE — may be correct
    - Test with `usbc_port_id=3` module parameter
 
-4. **AUX DPHY TX/RX configuration**
-   - Compare `AUX_DPHY_TX_CONTROL` and `AUX_DPHY_RX_CONTROL0` for AUX0 vs AUX1
-   - The AUX DPHY may need specific TX precharge or mode detection settings
-
 5. **VBIOS disassembly** (kernel dump at `0x07463bd7`)
    - Extract the ATOM BIOS image from the kernel dump
    - Parse the ATOM command table to find the PHY init command
-   - Look for the command that configures RDPCSTX for DP alt mode
    - The VBIOS has `DPAlt SSC OFF/ON` control — find the full sequence
 
 6. **PS5 firmware investigation**
-   - Disassemble code around "DPAlt SSC OFF/ON" strings in kernel dump
-   - Find the VBIOS command table that configures combo PHY
-   - Check if PS5 firmware calls `SET_OPT_PDP_ENABLE` before AUX works
-   - Investigate the `dce/regrw.c` register access layer
+   - Disassemble the ICC EDID read function at firmware offset 0x0090fa90
+   - Understand the setup command (length=0x6c) — what config does it set?
+   - Find how the south bridge knows to route to USB-C vs HDMI
+   - Check if the `edi` parameter (0=HDMI, 1=USB-C) maps to a specific ICC field
 
-### Lower priority
-7. **If AUX transfers succeed but EDID still fails**:
-   - The USB-C display may not respond at DPCD 0x0218
-   - Try reading DPCD 0x0000 (DPCD_REV) first to verify AUX works
-   - Check if the display supports I2C-over-AUX EDID read at addr 0x50
+### Lower priority (AUX approach — likely dead end)
+7. **AUX DPHY TX/RX configuration** — probably won't help
+   - AUX1 likely has no physical connection to USB-C SBU pins
+   - Compare AUX0 vs AUX1 registers for reference only
 
-8. **Alternative approach**: Read EDID directly via i2c-1 bus
-   (USB-C display's I2C adapter) instead of through AUX
-   - Bypass AUX entirely, use raw I2C for EDID read
-   - Would not support DPCD/link training but would get correct EDID
+8. **Alternative**: Read EDID directly via i2c-1 bus (USB-C DDC2)
+   - May also not work if DDC2 isn't physically routed to USB-C
+   - Would not support DPCD/link training
 
 ## Files Modified
 
