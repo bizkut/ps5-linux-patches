@@ -2636,7 +2636,7 @@ index ae4c4ad05..118ab5c4e 100644
  	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
  
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-index a66217e54..c52bc8cc0 100644
+index a66217e54..de54036bd 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 @@ -37,6 +37,11 @@
@@ -2672,7 +2672,7 @@ index a66217e54..c52bc8cc0 100644
  		DC_LOG_DC("BIOS object table - i2c_line: %d", i2c_info.i2c_line);
  		DC_LOG_DC("BIOS object table - i2c_engine_id: %d", i2c_info.i2c_engine_id);
  
-@@ -140,6 +157,21 @@ static void ddc_service_construct(
+@@ -140,6 +157,34 @@ static void ddc_service_construct(
  			&hw_info);
  	}
  
@@ -2688,6 +2688,19 @@ index a66217e54..c52bc8cc0 100644
 +	    init_data->id.enum_id == ENUM_ID_2) {
 +		pr_info("PS5:  USB-C connector using VBIOS DDC pin (i2c_line=%d)",
 +			i2c_info.i2c_line);
++		if (ddc_service->ddc_pin) {
++			pr_info("PS5:  USB-C DDC pin_data->en=%d (AUX engine index, before fix)",
++				ddc_service->ddc_pin->pin_data->en);
++			/* VBIOS maps USB-C DDC pin to AUX engine 0 (HDMI)
++			 * instead of AUX engine 1 (USB-C). Force en=1 so
++			 * AUX transfers use AUX1 (RDPCSTX1/combo PHY).
++			 * Without this, AUX fallback reads HDMI EDID.
++			 */
++			if (ddc_service->ddc_pin->pin_data->en == 0) {
++				ddc_service->ddc_pin->pin_data->en = 1;
++				pr_info("PS5:  USB-C DDC pin_data->en fixed: 0 -> 1");
++			}
++		}
 +	}
 +#endif
 +
