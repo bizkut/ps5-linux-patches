@@ -259,6 +259,59 @@ To read EDID from USB-C display in Linux:
 
 This bypasses the AUX engine entirely and matches what the PS5 firmware does.
 
+### IMPORTANT: USB-C is PSVR2-Only — VR Headset Type Check
+
+The PS5's USB-C port is designed **exclusively for PSVR2** in the PS5 OS.
+The firmware's USB-C display detection function (at offset `0x004b46c0`)
+checks a "VR headset type" flag (global at `0x02bd97e0`, read via `0x2f0880`)
+before attempting EDID read:
+
+```
+if (vr_headset_type == 0)      → no VR headset, different path (0x4b47e0)
+else if (vr_headset_type == 1) → PSVR2, EDID read via ICC (0x4b5330, edi=1)
+else if (vr_headset_type == 2) → different VR device, different EDID path (0x4b62d0, edi=1)
+else                           → error 0x8037000d
+```
+
+**This means:**
+- The ICC EDID read is **only attempted when a VR headset is detected**
+- A normal DP monitor connected via USB-C alt mode may NOT trigger the
+  VR headset detection, so the firmware would never read its EDID
+- The VR headset type flag is likely set by the USBC PD controller based
+  on the connected device's USB PD identity (PSVR2 has a specific PD identity)
+- A normal DP monitor would negotiate DP alt mode (DpAlt=1) but may not
+  set the VR headset type flag
+
+**However**, the ICC EDID read command itself (service_id=0x10, data[0]=4)
+should work for any DP device — the south bridge routes the I2C/EDID read
+to whatever is connected on USB-C. The VR headset check is in the calling
+code, not in the ICC command itself.
+
+**For Linux**: We can bypass the VR headset check entirely and send the
+ICC EDID read command directly. The south bridge should read EDID from
+whatever DP device is connected via USB-C alt mode, regardless of whether
+it's PSVR2 or a normal monitor.
+
+### PSVR2 vs Normal DP Monitor
+
+PSVR2 uses standard DisplayPort alt mode over USB-C:
+- DP alt mode is negotiated via USB PD (DpAlt=1, PinAssign)
+- The display signal is standard DP (dual 2000x2040 @ 120Hz)
+- EDID is standard DP EDID
+- Link training is standard DP
+
+The difference is only in the **detection logic** — the PS5 firmware checks
+for PSVR2-specific PD identity before proceeding. The actual display
+communication (EDID, link training) is standard DP over ICC.
+
+A normal DP monitor via USB-C alt mode:
+- Negotiates DP alt mode (DpAlt=1) ✓ (confirmed in our logs)
+- Has standard DP EDID ✓
+- Needs standard DP link training ✓
+- But won't have PSVR2 PD identity → firmware won't read its EDID
+
+**Linux solution**: Skip the PSVR2 check, send ICC EDID read directly.
+
 ## Register State (Latest Boot)
 
 Combo PHY (RDPCSTX1) register dump from `acquire_phy`:
