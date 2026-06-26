@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..f40637e5b 100644
+index a3cb05490..acdd59f14 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,18 @@ index a3cb05490..f40637e5b 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,141 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -36,6 +37,10 @@
+ #include <drm/drm_edid.h>
+ #include <drm/drm_fixed.h>
+ 
++#ifdef CONFIG_X86_PS5
++extern struct drm_edid *usbc_fallback_edid;
++#endif
++
+ #include "dm_services.h"
+ #include "amdgpu.h"
+ #include "dc.h"
+@@ -1100,6 +1105,147 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1973,6 +1984,11 @@ index a3cb05490..f40637e5b 100644
 +			 * PSVR2 headsets, not arbitrary USB-C displays. The GPU
 +			 * AUX engine times out because the combo PHY's AUX channel
 +			 * is not physically routed to the USB-C display.
++			 *
++			 * The fallback EDID is stored in usbc_fallback_edid so that
++			 * drm_edid_override_get() returns it for DP-2 in all code
++			 * paths (both dm_helpers_read_local_edid and the DRM probe
++			 * helper's drm_edid_read).
 +			 */
 +			if (!drm_edid) {
 +				struct edid *fallback_edid;
@@ -2007,8 +2023,9 @@ index a3cb05490..f40637e5b 100644
 +							sum += ((u8 *)fallback_edid)[i];
 +						((u8 *)fallback_edid)[EDID_LENGTH - 1] = (256 - sum) & 0xff;
 +					}
-+					drm_edid = drm_edid_alloc(fallback_edid, EDID_LENGTH);
++					usbc_fallback_edid = drm_edid_alloc(fallback_edid, EDID_LENGTH);
 +					kfree(fallback_edid);
++					drm_edid = drm_edid_dup(usbc_fallback_edid);
 +					DRM_INFO("PS5: Using fallback EDID for USB-C (no ICC/AUX EDID available)\n");
 +				}
 +			}
@@ -2947,21 +2964,23 @@ index 92510af1b..85c9e5878 100644
  #define FAMILY_VGH 144
  #define DEVICE_ID_VGH_163F 0x163F
 diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
-index 404208bf2..6039b8024 100644
+index 404208bf2..ac88369a8 100644
 --- a/drivers/gpu/drm/drm_edid.c
 +++ b/drivers/gpu/drm/drm_edid.c
-@@ -2242,6 +2242,10 @@ static void connector_bad_edid(struct drm_connector *connector,
+@@ -2242,6 +2242,12 @@ static void connector_bad_edid(struct drm_connector *connector,
  		edid_block_dump(KERN_DEBUG, edid + i, i);
  }
  
 +#ifdef CONFIG_X86_PS5
 +extern struct drm_edid *real_edid;
++struct drm_edid *usbc_fallback_edid;
++EXPORT_SYMBOL(usbc_fallback_edid);
 +#endif
 +
  /* Get override or firmware EDID */
  static const struct drm_edid *drm_edid_override_get(struct drm_connector *connector)
  {
-@@ -2257,6 +2261,17 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
+@@ -2257,6 +2263,22 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
  	if (!override)
  		override = drm_edid_load_firmware(connector);
  
@@ -2974,6 +2993,11 @@ index 404208bf2..6039b8024 100644
 +	if (IS_ERR(override) && real_edid &&
 +	    strcmp(connector->name, "DP-2") != 0)
 +		override = drm_edid_dup(real_edid);
++
++	/* For DP-2 (USB-C), use fallback EDID if set by dm_helpers_read_local_edid */
++	if (IS_ERR(override) && usbc_fallback_edid &&
++	    strcmp(connector->name, "DP-2") == 0)
++		override = drm_edid_dup(usbc_fallback_edid);
 +#endif
 +
  	return IS_ERR(override) ? NULL : override;
