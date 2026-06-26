@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..a3b0cbf46 100644
+index a3cb05490..26fe598bd 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..a3b0cbf46 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,88 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,89 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1942,14 +1942,15 @@ index a3cb05490..a3b0cbf46 100644
 +				DRM_INFO("PS5: AUX fallback: aux_mode=0 using i2c->base (connector=%s)\n",
 +					connector->name);
 +			}
-+			if (link->ddc && link->ddc->ddc_pin) {
-+				DRM_INFO("PS5: AUX fallback: link->ddc->ddc_pin->pin_data->en=%d\n",
-+					link->ddc->ddc_pin->pin_data->en);
-+			}
++			DRM_INFO("PS5: AUX fallback: link->ddc=%p link->ddc->ddc_pin=%p dm_dp_aux.ddc_service=%p\n",
++				link->ddc,
++				(link->ddc && link->ddc->ddc_pin) ? link->ddc->ddc_pin : NULL,
++				aconnector->dm_dp_aux.ddc_service);
 +			if (aconnector->dm_dp_aux.ddc_service &&
 +			    aconnector->dm_dp_aux.ddc_service->ddc_pin) {
-+				DRM_INFO("PS5: AUX fallback: dm_dp_aux.ddc_service->ddc_pin->pin_data->en=%d\n",
-+					aconnector->dm_dp_aux.ddc_service->ddc_pin->pin_data->en);
++				DRM_INFO("PS5: AUX fallback: dm_dp_aux.ddc_service->ddc_pin=%p (same as link->ddc? %s)\n",
++					aconnector->dm_dp_aux.ddc_service->ddc_pin,
++					(aconnector->dm_dp_aux.ddc_service->ddc_pin == link->ddc->ddc_pin) ? "YES" : "NO");
 +			}
 +			if (ddc) {
 +				DRM_INFO("PS5: AUX fallback: calling drm_edid_read_ddc\n");
@@ -1990,22 +1991,20 @@ index a3cb05490..a3b0cbf46 100644
  	 * do check sum and retry to make sure read correct edid.
  	 */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-index be038d901..02dcdf435 100644
+index be038d901..a1b1c3100 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-@@ -86,6 +86,17 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
+@@ -86,6 +86,15 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
  
  	result = dc_link_aux_transfer_raw(TO_DM_AUX(aux)->ddc_service, &payload,
  				      &operation_result);
 +#ifdef CONFIG_X86_PS5
 +	{
 +		struct ddc_service *dbg_ddc = TO_DM_AUX(aux)->ddc_service;
-+		int en = -1;
-+		if (dbg_ddc && dbg_ddc->ddc_pin)
-+			en = dbg_ddc->ddc_pin->pin_data->en;
-+		pr_info("PS5: dm_dp_aux_transfer: ddc_service=%p ddc_pin=%p en=%d addr=0x%04x len=%d",
-+			dbg_ddc, dbg_ddc ? dbg_ddc->ddc_pin : NULL,
-+			en, msg->address, msg->size);
++		pr_info("PS5: dm_dp_aux_transfer: ddc_service=%p ddc_pin=%p addr=0x%04x len=%d",
++			dbg_ddc,
++			(dbg_ddc && dbg_ddc->ddc_pin) ? dbg_ddc->ddc_pin : NULL,
++			msg->address, msg->size);
 +	}
 +#endif
  
