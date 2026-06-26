@@ -2636,7 +2636,7 @@ index ae4c4ad05..118ab5c4e 100644
  	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
  
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-index a66217e54..6a5bae1f3 100644
+index a66217e54..56075b2ec 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 @@ -37,6 +37,11 @@
@@ -2712,6 +2712,26 @@ index a66217e54..6a5bae1f3 100644
  
  	ddc_service->flags.EDID_QUERY_DONE_ONCE = false;
  	ddc_service->flags.FORCE_READ_REPEATED_START = false;
+@@ -402,6 +451,19 @@ int link_aux_transfer_raw(struct ddc_service *ddc,
+ 		struct aux_payload *payload,
+ 		enum aux_return_code_type *operation_result)
+ {
++#ifdef CONFIG_X86_PS5
++	/* PS5 USB-C: Force native AUX (not DMUB) for USB-C connector.
++	 * DMUB uses its own AUX engine selection which maps both connectors
++	 * to AUX0, causing EDID reads from the wrong display.
++	 * Native AUX uses ddc_pin->pin_data->en which we override to 1
++	 * for USB-C (AUX1).
++	 */
++	if (ddc->ddc_pin && ddc->link &&
++	    ddc->link->link_enc &&
++	    ddc->link->link_enc->features.flags.bits.DP_IS_USB_C) {
++		return dce_aux_transfer_raw(ddc, payload, operation_result);
++	}
++#endif
+ 	if (ddc->ctx->dc->debug.enable_dmub_aux_for_legacy_ddc ||
+ 	    !ddc->ddc_pin) {
+ 		return dce_aux_transfer_dmub_raw(ddc, payload, operation_result);
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
 index 782a45caa..444259795 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
