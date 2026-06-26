@@ -69,91 +69,149 @@ messages over the spcie bus.
 
 ## Current Status
 
-### WORKING — USB-C DisplayPort Alt Mode Confirmed!
-- **EDID read via AUX fallback** — ICC EDID read times out (HPD=0, no notification from south bridge), but AUX fallback successfully reads EDID
-- **Display detected**: 2560x1440 monitor connected via USB-C DP alt mode
-- **Modes detected**: 2560x1440, 1920x1080 (x2)
-- **DP-2 connector**: connected, enabled, DPMS=On
-- **gnome-shell driving the display**: framebuffer allocated at 2560x1440
-- **AUX transactions fully working** on USB-C (en=1): DPCD reads, EDID read, link training
-- USB-C ICC communication with PD controller
-- DP alt mode detection (DpAlt=1, ConnState=1)
-- HPD CONNECT/DISCONNECT event firing
-- amdgpu callback registration and connector detection
-- DP-2 connector created and shows `connected` status
-- Combo PHY registers correctly mapped (RDPCSTX1 offsets)
-- `acquire_phy` succeeds: DPALT_DISABLE=0, REF_CLK_EN=1
-- AUX engine correctly selected (en=1, AUX1 for USB-C)
-- AUX engine enabled (AUX_EN=1)
-- AUX_HPD_SEL corrected from HPD1 to HPD2
-- AUX_IGNORE_HPD_DISCON set (bit 16) — bypasses HPD check for AUX
-- HDMI AUX (DP-1, en=0) fully working: DPCD reads, EDID read, link training
-- PHY CNTL0 writes work via dm_write_reg: HDMI→DP mode switch + reset release confirmed
-- Linux loader USB-C init: `mp3_enable_output(1,1)` added and confirmed in binary
+### WORKING — HDMI (DP-1)
+- HDMI EDID read via ICC by PS5 OS at boot, delivered via `real_edid` override
+- Display detected, modes detected, framebuffer working
+- AUX transactions fully working on HDMI (en=0): DPCD reads, EDID read, link training
 
-### ICC EDID Read Status
-- ICC setup command (0x6c bytes) succeeds: status 0,0
-- ICC EDID read command (0x20 bytes) succeeds: status 0,0, returns 29 bytes
-- BUT: EDID notification never arrives (3s timeout) — HPD=0 is the cause
-- The south bridge won't attempt I2C EDID read without HPD asserted
-- **Solution**: Fall back to AUX-based EDID read (drm_edid_read_ddc) when ICC fails
-- AUX works because AUX_IGNORE_HPD_DISCON bypasses the HPD check
+### PARTIAL — USB-C (DP-2)
+- USB-C ICC communication with PD controller: WORKING
+- DP alt mode detection (DpAlt=1, ConnState=1): WORKING
+- HPD CONNECT/DISCONNECT event firing: WORKING
+- DP-2 connector created and shows `connected` status: WORKING
+- Combo PHY registers correctly mapped (RDPCSTX1 offsets): WORKING
+- `acquire_phy` succeeds: DPALT_DISABLE=0, REF_CLK_EN=1: WORKING
+- AUX engine correctly selected (en=1, AUX1 for USB-C): WORKING
+- AUX engine enabled (AUX_EN=1, HPD_SEL=2, IGNORE_HPD_DISCON=1): WORKING
+- Start EMC service (service_id=0x70, data[0]=0 for USB-C): WORKING (reply data[0]=4, data[1]=0)
+- HotPlug Status query (service_id=0x10): WORKING — **south bridge sees HPD=1** (data[4]=0x01)
+- PHY CNTL0 writes work via dm_write_reg: HDMI→DP mode switch + reset release confirmed
+
+### NOT WORKING — USB-C EDID Read
+Three approaches tried, all fail:
+
+1. **ICC EDID read** — setup + read commands succeed (status 0,0), but the
+   async EDID notification never arrives (3s timeout). The south bridge only
+   sends EDID notifications for PSVR2 headsets, not arbitrary USB-C displays.
+   The PS5 firmware has three gates (VR headset type flags) before EDID read.
+
+2. **AUX fallback (AUX1, en=1)** — correctly uses AUX engine 1 for USB-C, but
+   all transfers time out (operation_result=3 = AUX_RET_ERROR_TIMEOUT). The
+   combo PHY's AUX channel is not physically routed to the USB-C display.
+   `IGNORE_HPD_DISCON` is set but doesn't help — the issue is no physical
+   AUX connection, not HPD rejection.
+
+3. **I2C buses** — no devices detected on any I2C bus (i2c-0 through i2c-3)
+   for USB-C. The display's EDID is not accessible via I2C.
+
+### WORKAROUND — Fallback EDID
+When both ICC and AUX fail, a minimal EDID (v1.4, digital input, sRGB,
+continuous timing) is created so the DRM subsystem can set standard modes
+like 1920x1080@60Hz. This doesn't give the display's native resolution
+but allows a usable signal.
+
+### Root Cause: `real_edid` Override Bug (FIXED)
+Previous boots showed DP-2 with HDMI's EDID because `drm_edid_override_get()`
+has a PS5-specific fallback that returns `real_edid` (HDMI EDID from `hdmi.c`)
+for ALL connectors. Fixed by checking `strcmp(connector->name, "DP-2") != 0`
+— only DP-2 (USB-C) is excluded from the `real_edid` override.
+
+### Key Discovery: South Bridge vs PD Controller HPD
+- `GET_DEV_CONN_STATE` (PD controller): `Hpd(0)` — always 0
+- HotPlug Status (south bridge ICC): `HPD=1` — connected!
+- The PD controller's HPD flag is the USB PD DP_HPD VDM status
+- The south bridge's HPD is a separate hardware/software signal
+- The south bridge sees HPD=1 but still doesn't send EDID notifications
 
 ### Latest Boot Log Analysis (2026-06-26)
 ```
-usbc: SET_PDCON_OP_MODE PortId(00) OpMode(5)         # sent to port 0
-usbc: GET_DEV_CONN_STATE [OK] PortId(03) ...          # device on port 3!
+# HDMI (DP-1) — working
+hdmi: got real edid                                    # PS5 OS reads HDMI EDID
+PS5:  HDMI PHY CNTL0=0x30110704                        # HDMI PHY configured
+PS5: dce_aux_transfer_raw: en=0 ... operation_result=0 # HDMI AUX works (94 transfers)
+
+# USB-C (DP-2) — connected, EDID unavailable
 usbc: DP alt mode active at boot
-PS5: Combo PHY DP alt mode at init: ENABLED
-PS5: dce_aux_transfer_raw: en=0 ... operation_result=0  # HDMI AUX works
-PS5: dce_aux_transfer_raw: en=0 ... operation_result=0  # (many successful transfers)
-PS5: Combo PHY power: CNTL0=0x10108705                  # PHY in reset + HDMI mode
-PS5: After HDMI->DP: CNTL0=0x10108605                   # DP mode (bit 8 cleared)
-PS5: After reset release: CNTL0=0x10108604              # Reset released (bit 0 cleared)
-PS5: After AUX fix: AUX_CONTROL=0x01250001              # AUX_EN=1 HPD_SEL=2
-PS5: Combo PHY DPALT_DISABLE = 0                        # Alt mode enabled
-PS5: Combo PHY acquired for DP alt mode
-PS5: dce_aux_transfer_raw: en=1 addr=0x0218 ... operation_result=3  # TIMEOUT x32
-PS5: emulated_link_detect: EDID status=0                # No EDID
+PS5:  Set DP_IS_USB_C and usbc_combo_phy for USB-C connector (enum_id=2)
+PS5:  Combo PHY DP alt mode at init: ENABLED
+usbc: Sending Start EMC service (service_id=0x70, data[0]=0)
+usbc: EMC service reply: service_id=0x70 msg_type=0x4086 length=32
+usbc: EMC service status: data[0]=4 data[1]=0          # OK
+usbc: Querying HotPlug status via ICC
+usbc: HotPlug status: data[4]=0x01 HPD=1               # South bridge sees HPD!
+usbc: Sending ICC HDMI setup command (0x6c bytes)
+usbc: Setup status: data[0]=0 data[1]=0                # OK
+usbc: Sending ICC HDMI EDID read command (0x20 bytes)
+usbc: EDID read reply: data_len=29                     # Reply has status only
+usbc: Waiting for EDID notification...
+usbc: EDID notification timeout                        # 3s timeout — no notification
+
+# AUX fallback — uses correct engine but times out
+PS5:  After AUX fix: AUX_CONTROL=0x01250001            # AUX_EN=1 HPD_SEL=2 IGNORE_HPD=1
+PS5:  Combo PHY DPALT_DISABLE = 0
+PS5: link_aux_transfer_raw: ddc_pin=... en=1 addr=0x0050  # Correct engine!
+PS5: dce_aux_transfer_raw: en=1 addr=0x0050 operation_result=3  # TIMEOUT x30
+AUX: HPD_DISCON but DONE — continuing (PS5 USB-C)      # Workaround fires once
+
+# Fallback EDID
+PS5: Using fallback EDID for USB-C (no ICC/AUX EDID available)
+PS5: emulated_link_detect: EDID status=0
+
+# Result
+DP-1: connected, enabled, 2560x1440 + 1920x1080 modes
+DP-2: connected, disabled, no modes (fallback EDID has no detailed timings)
 ```
 
 ### Key Issues Identified
 
-**Issue 6: Port ID mismatch (NEW)**
+**Issue 1: ICC EDID notification not arriving (BLOCKING)**
+- ICC setup + EDID read commands succeed (status 0,0)
+- South bridge HotPlug status shows HPD=1
+- But the async EDID notification (data[1]==0x02) never arrives
+- The south bridge only sends EDID notifications for PSVR2 headsets
+- PS5 firmware has three gates (VR headset type flags) before EDID read
+- **Status**: No solution yet — south bridge firmware limitation
+
+**Issue 2: AUX1 times out for USB-C (BLOCKING)**
+- AUX engine 1 (en=1) correctly selected for USB-C
+- AUX_CONTROL: AUX_EN=1, HPD_SEL=2, IGNORE_HPD_DISCON=1
+- All transfers return operation_result=3 (AUX_RET_ERROR_TIMEOUT)
+- The combo PHY's AUX channel is not physically routed to USB-C display
+- `IGNORE_HPD_DISCON` doesn't help — issue is no physical AUX connection
+- **Status**: Confirmed dead end — AUX is not routed to USB-C
+
+**Issue 3: `real_edid` override returning HDMI EDID for DP-2 (FIXED)**
+- `drm_edid_override_get()` PS5 fallback returned `real_edid` (HDMI EDID) for ALL connectors
+- DP-2 got HDMI's EDID instantly (6 microseconds, no actual I2C transfers)
+- Fix: `strcmp(connector->name, "DP-2") != 0` — only DP-2 excluded from override
+
+**Issue 4: Port ID mismatch**
 - `SET_PDCON_OP_MODE` sends to PortId(00) but device reports PortId(03)
-- All ICC commands hardcoded to port_id=0
-- The PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE, so port 0 may be correct
-- But GET_DEV_CONN_STATE returns PortId=3 — the actual USB-C port is port 3
-- Fix: Added `usbc_port_id` module parameter (default 0) to test different port IDs
-- Try `modprobe usbc usbc_port_id=3` to send commands to the actual device port
+- PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE — likely correct
+- `usbc_port_id` module parameter available for testing
 
-**Issue 7: SET_OPT_PDP_ENABLE not yet tested (NEW)**
-- New ICC command (msg_type 0x12) added to USBC driver
-- Enables DP power delivery on the USB-C port
-- Not in the current running kernel — needs rebuild via GitHub Actions
-- Called after SET_PDCON_OP_MODE in init sequence
+**Issue 5: HPD not asserted in GET_DEV_CONN_STATE**
+- `GET_DEV_CONN_STATE` shows Hpd=0 (PD controller view)
+- HotPlug Status query shows HPD=1 (south bridge view)
+- The PD controller's HPD flag is the USB PD DP_HPD VDM status
+- The south bridge's HPD is a separate signal
+- **Status**: Not blocking — south bridge sees HPD=1
 
-**Issue 8: HPD not asserted (Hpd=0)**
-- GET_DEV_CONN_STATE shows Hpd=0 even though device is connected (ConnState=1, DpAlt=1)
-- The USB-C display is connected and DP alt mode is negotiated, but HPD is not asserted
-- This may be normal — PS5 USB-C HPD is virtual (via ICC PD controller)
-- The AUX_IGNORE_HPD_DISCON bypass should handle this
+**Issue 6: MP3 enable_output doesn't configure PHY**
+- The loader calls `mp3_enable_output(1,1)` for USB-C (be=1)
+- MP3 handles display pipeline (scanout, HDCP), not combo PHY
+- PHY configuration done in Linux kernel driver (acquire_phy)
+- **Status**: Understood, not an issue
 
-**Issue 9: MP3 enable_output doesn't configure PHY**
-- The loader now calls `mp3_enable_output(1,1)` for USB-C (be=1)
-- But PHY registers (CNTL0) are unchanged from previous boots
-- MP3 likely enables the display pipeline (scanout, HDCP) not the combo PHY
-- PHY configuration must be done in Linux kernel driver (acquire_phy)
-
-**Issue 10: PS5 firmware uses ICC for ALL display communication (CRITICAL)**
+**Issue 7: PS5 firmware uses ICC for ALL display communication**
 - The PS5 firmware uses ICC (service_id=0x10, HDMI service) for ALL display
   operations — both HDMI AND USB-C
 - EDID read, DDC read, DP link status, DP equalizer, HDCP — all via ICC
 - The GPU's AUX engines (AUX0/AUX1) are NOT used by the PS5 firmware
 - The south bridge (Belize/EMC) handles actual display communication
 - Linux uses standard AUX for HDMI (works via FLAVA3 IC) but AUX1 for
-  USB-C times out — the combo PHY may not route SBU to AUX1 at all
-- **Solution**: Implement ICC-based EDID read for USB-C, matching PS5 firmware
+  USB-C times out — the combo PHY does not route SBU to AUX1
+- **Status**: ICC EDID implemented but notification doesn't arrive for non-PSVR2
 
 ## PS5 Firmware ICC Display Architecture (NEW)
 
@@ -1019,40 +1077,64 @@ SVM guest mode). The MP3 USB-C calls don't hurt but are likely unnecessary.
 
 Recommendation: keep for now until full pipeline works, then test removing.
 
-### Medium priority
-4. **DP link training via ICC** — needed after EDID read works
-   - The kernel uses AUX for DPCD reads (link status, link training)
-   - AUX doesn't work for USB-C — needs ICC-based DPCD read
-   - Firmware uses ICC for DP link status (service_id=0x10, different sub-command)
-   - This is the next major blocker after EDID read
+## Next Steps
 
-5. **Port ID investigation**
+### High priority — getting USB-C display to produce output
+1. **Test fallback EDID** — verify the minimal EDID allows DP-2 to be enabled
+   with standard modes (1920x1080@60Hz). The fallback EDID has no detailed
+   timings but advertises continuous timing support.
+   - May need to add a DisplayID or CTA-861 extension block with standard
+     modes if the base EDID alone doesn't provide enough modes.
+   - May need to force DP-2 enabled via `xrandr --output DP-2 --mode 1920x1080`
+
+2. **DP link training** — even with EDID, link training via AUX will fail
+   (AUX1 times out). Need to either:
+   - Implement ICC-based DPCD read/write (firmware uses ICC for DP link status)
+   - Or skip link training and force a fixed link rate (e.g. RBR 1.62 Gbps)
+   - The kernel's `dc_link_dp_perform_link_training()` uses AUX for DPCD
+     reads/writes — all will time out for USB-C
+
+3. **Investigate alternative EDID sources**:
+   - USB-C display may expose EDID via USB descriptor (for USB-C docks)
+   - Check if the display supports DisplayID over USB
+   - Check if the PD controller can provide display info via ICC
+
+### Medium priority
+4. **Port ID investigation**
    - GET_DEV_CONN_STATE returns PortId=3 but commands send to PortId=0
    - PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE — may be correct
    - Test with `usbc_port_id=3` module parameter
 
-### Lower priority (AUX approach — confirmed dead end)
-6. **AUX DPHY TX/RX configuration** — won't help
+### Confirmed dead ends
+5. **AUX DPHY TX/RX configuration** — won't help
    - AUX1 has no physical connection to USB-C SBU pins
    - PS5 firmware uses ICC for all display communication, not AUX
+   - All AUX1 transfers time out regardless of AUX_CONTROL settings
+
+6. **ICC EDID notification for non-PSVR2** — won't work
+   - South bridge only sends EDID notifications for PSVR2 headsets
+   - Three firmware gates (VR headset type flags) prevent EDID read
+   - ICC commands succeed but no async notification arrives
 
 ## Files Modified
 
-### Kernel (`linux.patch` — 71 files total)
+### Kernel (`linux.patch` — 85 files total)
 - `drivers/ps5/usbc.c` — USB-C ICC driver (new): SET_PDCON_OP_MODE, SET_OPT_PDP_ENABLE, GET_DEV_CONN_STATE, NOTIFY_SOC_WORKING, HPD callback, polling, debugfs, ICC EDID read (setup + read commands + notification handler), Start EMC service (service_id=0x70), HotPlug Status query (service_id=0x10), `#include <drm/drm_edid.h>` for EDID_LENGTH
 - `drivers/ps5/spcie.c` — USBC notification dispatch
 - `drivers/ps5/Makefile` — Add usbc.o
 - `include/linux/ps5.h` — USBC API declarations (ps5_usbc_set_opt_pdp_enable, ps5_usbc_read_edid, ps5_usbc_start_emc_service, ps5_usbc_query_hotplug_status, etc.)
+- `drivers/gpu/drm/drm_edid.c` — `real_edid` override fix: exclude DP-2 (USB-C) from HDMI EDID override via `strcmp(connector->name, "DP-2")`
 - `drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c` — Connector injection for USB-C, svm_transmitter_control_v1_6
 - `drivers/gpu/drm/amd/display/dc/link/link_factory.c` — DP_IS_USB_C, usbc_combo_phy, alt mode log
-- `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config for USB-C
+- `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config for USB-C, force pin_data->en=1 for enum_id=2
 - `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c` — acquire_phy (combo PHY HDMI→DP, reset release, AUX engine enable, HPD_SEL fix, IGNORE_HPD_DISCON), enable_dp_output, disable_output, full CNTL0-CNTL14 register dumps for HDMI and USB-C
 - `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h` — DPCS_DCN201_MASK_SH_LIST cleanup
 - `drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c` — DPCS_DCN2_CMN_REG_LIST in link_regs, DPALT shift/mask defines, missing register offset defines, LE_SF entries
 - `drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h` — acquire_phy/release_phy function pointers
 - `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log, force=ON for USB-C
-- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — ICC-based EDID read for USB-C DP alt mode (DP_IS_USB_C + is_in_alt_mode detection, ps5_usbc_read_edid call, drm_edid_alloc)
-- `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result, returned_bytes)
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — ICC-based EDID read for USB-C DP alt mode, AUX fallback with `drm_edid_read_ddc`, fallback EDID generation when both ICC and AUX fail, EDID mfg/product logging
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c` — `dm_dp_aux_transfer` debug logging (ddc_service, ddc_pin, addr, len)
+- `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result, returned_bytes), HPD_DISCON workaround (continue if DONE)
 
 ### Linux Loader (`ps5-linux-loader`)
 - `shellcode_kernel/boot_linux.c` — Added `mp3_set_hdcp_packet(1, 1)` and `mp3_enable_output(1, 1)` for USB-C (be=1)
