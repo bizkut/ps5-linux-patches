@@ -69,34 +69,35 @@ messages over the spcie bus.
 
 ## Current Status
 
-### Working
+### WORKING — USB-C DisplayPort Alt Mode Confirmed!
+- **EDID read via AUX fallback** — ICC EDID read times out (HPD=0, no notification from south bridge), but AUX fallback successfully reads EDID
+- **Display detected**: 2560x1440 monitor connected via USB-C DP alt mode
+- **Modes detected**: 2560x1440, 1920x1080 (x2)
+- **DP-2 connector**: connected, enabled, DPMS=On
+- **gnome-shell driving the display**: framebuffer allocated at 2560x1440
+- **AUX transactions fully working** on USB-C (en=1): DPCD reads, EDID read, link training
 - USB-C ICC communication with PD controller
 - DP alt mode detection (DpAlt=1, ConnState=1)
 - HPD CONNECT/DISCONNECT event firing
 - amdgpu callback registration and connector detection
 - DP-2 connector created and shows `connected` status
-- DPMS on, framebuffer console active on HDMI
-- No kernel crash (dc_helper.c ASSERT fixed)
 - Combo PHY registers correctly mapped (RDPCSTX1 offsets)
 - `acquire_phy` succeeds: DPALT_DISABLE=0, REF_CLK_EN=1
 - AUX engine correctly selected (en=1, AUX1 for USB-C)
 - AUX engine enabled (AUX_EN=1)
 - AUX_HPD_SEL corrected from HPD1 to HPD2
-- AUX transaction mode confirmed (aux_mode=1, transaction_type=2)
-- DDC adapter non-NULL for DP-2 EDID read
-- **HDMI AUX (DP-1, en=0) fully working**: DPCD reads, EDID read, link training
-- **PHY CNTL0 writes work via dm_write_reg**: HDMI→DP mode switch + reset release confirmed
-- **Linux loader USB-C init**: `mp3_enable_output(1,1)` added and confirmed in binary
+- AUX_IGNORE_HPD_DISCON set (bit 16) — bypasses HPD check for AUX
+- HDMI AUX (DP-1, en=0) fully working: DPCD reads, EDID read, link training
+- PHY CNTL0 writes work via dm_write_reg: HDMI→DP mode switch + reset release confirmed
+- Linux loader USB-C init: `mp3_enable_output(1,1)` added and confirmed in binary
 
-### Not Working / Untested
-- **USB-C AUX transactions (DP-2, en=1) fail with TIMEOUT** — expected, AUX is wrong approach
-  - PS5 firmware uses ICC for ALL display communication, NOT AUX
-  - The combo PHY doesn't route SBU to AUX1
-  - **SOLUTION**: ICC-based EDID read implemented (see below)
-- **ICC-based EDID read — IMPLEMENTED, NEEDS TESTING**
-  - Setup command (0x6c bytes) + EDID read command (0x20 bytes) sent
-  - EDID expected via async ICC notification
-  - Untested with actual USB-C DP display — needs boot test
+### ICC EDID Read Status
+- ICC setup command (0x6c bytes) succeeds: status 0,0
+- ICC EDID read command (0x20 bytes) succeeds: status 0,0, returns 29 bytes
+- BUT: EDID notification never arrives (3s timeout) — HPD=0 is the cause
+- The south bridge won't attempt I2C EDID read without HPD asserted
+- **Solution**: Fall back to AUX-based EDID read (drm_edid_read_ddc) when ICC fails
+- AUX works because AUX_IGNORE_HPD_DISCON bypasses the HPD check
 
 ### Latest Boot Log Analysis (2026-06-26)
 ```
