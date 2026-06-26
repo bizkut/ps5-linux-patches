@@ -11632,6 +11632,28 @@ index 000000000..90d41d3dc
 +void salina_start_xhci_poller(struct xhci_hcd *xhci);
 +void salina_stop_xhci_poller(void);
 \ No newline at end of file
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index e47e644b2..c332b9aa9 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -59,6 +59,8 @@
+ #include <linux/dma-mapping.h>
+ #include "xhci.h"
+ #include "xhci-trace.h"
++#include "xhci-ring.h"
++#include "xhci-ps5.h"
+ 
+ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
+ 			 u32 field1, u32 field2,
+@@ -3083,7 +3085,7 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
+  * Handle all OS-owned events on an interrupter event ring. It may drop
+  * and reaquire xhci->lock between event processing.
+  */
+-static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
++int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
+ 			      bool skip_events)
+ {
+ 	int event_loop = 0;
 diff --git a/drivers/usb/host/xhci-ring.h b/drivers/usb/host/xhci-ring.h
 new file mode 100755
 index 000000000..193ac03a3
