@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..52fbe8d95 100644
+index a3cb05490..a3b0cbf46 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..52fbe8d95 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,73 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,88 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1933,11 +1933,26 @@ index a3cb05490..52fbe8d95 100644
 +			 * in dcn201_link_encoder.c, so AUX should work even with
 +			 * HPD=0 (virtual HPD via ICC PD controller).
 +			 */
-+			if (link->aux_mode)
++			if (link->aux_mode) {
 +				ddc = &aconnector->dm_dp_aux.aux.ddc;
-+			else
++				DRM_INFO("PS5: AUX fallback: aux_mode=1 using dm_dp_aux.aux.ddc (connector=%s)\n",
++					connector->name);
++			} else {
 +				ddc = &aconnector->i2c->base;
++				DRM_INFO("PS5: AUX fallback: aux_mode=0 using i2c->base (connector=%s)\n",
++					connector->name);
++			}
++			if (link->ddc && link->ddc->ddc_pin) {
++				DRM_INFO("PS5: AUX fallback: link->ddc->ddc_pin->pin_data->en=%d\n",
++					link->ddc->ddc_pin->pin_data->en);
++			}
++			if (aconnector->dm_dp_aux.ddc_service &&
++			    aconnector->dm_dp_aux.ddc_service->ddc_pin) {
++				DRM_INFO("PS5: AUX fallback: dm_dp_aux.ddc_service->ddc_pin->pin_data->en=%d\n",
++					aconnector->dm_dp_aux.ddc_service->ddc_pin->pin_data->en);
++			}
 +			if (ddc) {
++				DRM_INFO("PS5: AUX fallback: calling drm_edid_read_ddc\n");
 +				drm_edid = drm_edid_read_ddc(connector, ddc);
 +				if (drm_edid)
 +					DRM_INFO("PS5: AUX EDID read OK (fallback)\n");
@@ -1974,6 +1989,28 @@ index a3cb05490..52fbe8d95 100644
  	/* some dongles read edid incorrectly the first time,
  	 * do check sum and retry to make sure read correct edid.
  	 */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index be038d901..02dcdf435 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -86,6 +86,17 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
+ 
+ 	result = dc_link_aux_transfer_raw(TO_DM_AUX(aux)->ddc_service, &payload,
+ 				      &operation_result);
++#ifdef CONFIG_X86_PS5
++	{
++		struct ddc_service *dbg_ddc = TO_DM_AUX(aux)->ddc_service;
++		int en = -1;
++		if (dbg_ddc && dbg_ddc->ddc_pin)
++			en = dbg_ddc->ddc_pin->pin_data->en;
++		pr_info("PS5: dm_dp_aux_transfer: ddc_service=%p ddc_pin=%p en=%d addr=0x%04x len=%d",
++			dbg_ddc, dbg_ddc ? dbg_ddc->ddc_pin : NULL,
++			en, msg->address, msg->size);
++	}
++#endif
+ 
+ 	/*
+ 	 * w/a on certain intel platform where hpd is unexpected to pull low during
 diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
 index 0e1f97332..a75f4b9e9 100644
 --- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
@@ -2636,7 +2673,7 @@ index ae4c4ad05..118ab5c4e 100644
  	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
  
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-index a66217e54..de54036bd 100644
+index a66217e54..799e4e164 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 @@ -37,6 +37,11 @@
@@ -2707,6 +2744,24 @@ index a66217e54..de54036bd 100644
  	ddc_service->flags.EDID_QUERY_DONE_ONCE = false;
  	ddc_service->flags.FORCE_READ_REPEATED_START = false;
  	ddc_service->flags.EDID_STRESS_READ = false;
+@@ -402,6 +447,17 @@ int link_aux_transfer_raw(struct ddc_service *ddc,
+ 		struct aux_payload *payload,
+ 		enum aux_return_code_type *operation_result)
+ {
++#ifdef CONFIG_X86_PS5
++	{
++		int en = -1;
++		if (ddc->ddc_pin)
++			en = ddc->ddc_pin->pin_data->en;
++		pr_info("PS5: link_aux_transfer_raw: ddc_pin=%p en=%d dmub_for_legacy=%d addr=0x%04x",
++			ddc->ddc_pin, en,
++			ddc->ctx->dc->debug.enable_dmub_aux_for_legacy_ddc,
++			payload->address);
++	}
++#endif
+ 	if (ddc->ctx->dc->debug.enable_dmub_aux_for_legacy_ddc ||
+ 	    !ddc->ddc_pin) {
+ 		return dce_aux_transfer_dmub_raw(ddc, payload, operation_result);
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
 index 782a45caa..444259795 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
