@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..e2ec51a50 100644
+index a3cb05490..52fbe8d95 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..e2ec51a50 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,58 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,73 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1927,8 +1927,23 @@ index a3cb05490..e2ec51a50 100644
 +			drm_edid = drm_edid_alloc(icc_edid, icc_ret);
 +			DRM_INFO("PS5: ICC EDID read OK (%d bytes)\n", icc_ret);
 +		} else {
-+			DRM_ERROR("PS5: ICC EDID read failed: %d\n", icc_ret);
++			DRM_ERROR("PS5: ICC EDID read failed: %d, trying AUX fallback\n", icc_ret);
 +			drm_edid = NULL;
++			/* Fall back to AUX/DDC read. We set AUX_IGNORE_HPD_DISCON
++			 * in dcn201_link_encoder.c, so AUX should work even with
++			 * HPD=0 (virtual HPD via ICC PD controller).
++			 */
++			if (link->aux_mode)
++				ddc = &aconnector->dm_dp_aux.aux.ddc;
++			else
++				ddc = &aconnector->i2c->base;
++			if (ddc) {
++				drm_edid = drm_edid_read_ddc(connector, ddc);
++				if (drm_edid)
++					DRM_INFO("PS5: AUX EDID read OK (fallback)\n");
++				else
++					DRM_ERROR("PS5: AUX EDID fallback also failed\n");
++			}
 +		}
 +		drm_edid_connector_update(connector, drm_edid);
 +
@@ -2158,10 +2173,38 @@ index 05991a10f..777593ddd 100644
  			dc_version = DCN_VERSION_2_01;
  			break;
 diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
-index 673bb87d2..c7144160d 100644
+index 673bb87d2..a7f99efd9 100644
 --- a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
 +++ b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
-@@ -575,8 +575,16 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+@@ -351,9 +351,24 @@ static enum aux_return_code_type get_channel_status(
+ 				10, aux110->polling_timeout_period/10);
+ 
+ 	value = REG_READ(AUX_SW_STATUS);
+-	/* in case HPD is LOW, exit AUX transaction */
+-	if ((value & AUX_SW_STATUS__AUX_SW_HPD_DISCON_MASK))
+-		return AUX_RET_ERROR_HPD_DISCON;
++	/* In case HPD is LOW, exit AUX transaction.
++	 * PS5 USB-C: HPD is virtual (via ICC PD controller) and may not be
++	 * routed to the DCN HPD pin. The AUX_IGNORE_HPD_DISCON bit in
++	 * AUX_CONTROL should prevent this bit from being set, but if it
++	 * is set anyway, log a warning and continue — the AUX transaction
++	 * may still succeed if the display is connected via DP alt mode.
++	 */
++	if ((value & AUX_SW_STATUS__AUX_SW_HPD_DISCON_MASK)) {
++		/* Check if AUX_SW_DONE is also set — if so, the transaction
++		 * completed despite HPD being low. This happens on PS5 USB-C
++		 * where HPD is virtual but AUX signals are physically routed.
++		 */
++		if (!(value & AUX_SW_STATUS__AUX_SW_DONE_MASK)) {
++			pr_info("AUX: HPD_DISCON and not DONE, aborting\n");
++			return AUX_RET_ERROR_HPD_DISCON;
++		}
++		pr_info("AUX: HPD_DISCON but DONE — continuing (PS5 USB-C)\n");
++	}
+ 
+ 	/* Note that the following bits are set in 'status.bits'
+ 	 * during CTS 4.2.1.2 (FW 3.3.1):
+@@ -575,8 +590,16 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
  	}
  
  	aux_engine = ddc->ctx->dc->res_pool->engines[ddc_pin->pin_data->en];
@@ -2178,7 +2221,7 @@ index 673bb87d2..c7144160d 100644
  		return -1;
  	}
  
-@@ -595,6 +603,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+@@ -595,6 +618,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
  	submit_channel_request(aux_engine, &aux_req);
  	*operation_result = get_channel_status(aux_engine, &returned_bytes);
  
@@ -2190,6 +2233,23 @@ index 673bb87d2..c7144160d 100644
  	if (*operation_result == AUX_RET_SUCCESS) {
  		int __maybe_unused bytes_replied = 0;
  
+@@ -884,6 +912,7 @@ bool dce_aux_transfer_with_retries(struct ddc_service *ddc,
+ 				DC_TRACE_LEVEL_MESSAGE(DAL_TRACE_LEVEL_INFORMATION,
+ 							LOG_FLAG_I2cAux_DceAux,
+ 							"dce_aux_transfer_with_retries: AUX_RET_SUCCESS: AUX_TRANSACTION_REPLY_HPD_DISCON");
++				pr_info("AUX: reply HPD_DISCON (PS5 USB-C)\n");
+ 				goto fail;
+ 
+ 			default:
+@@ -950,6 +979,8 @@ bool dce_aux_transfer_with_retries(struct ddc_service *ddc,
+ 			break;
+ 
+ 		case AUX_RET_ERROR_HPD_DISCON:
++			pr_info("AUX: HPD_DISCON — display may not be asserting HPD (PS5 USB-C)\n");
++			goto fail;
+ 		case AUX_RET_ERROR_ENGINE_ACQUIRE:
+ 		case AUX_RET_ERROR_UNKNOWN:
+ 		default:
 diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
 index 9459e8f28..19aaf042a 100644
 --- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
