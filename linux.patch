@@ -2902,7 +2902,7 @@ index 92510af1b..85c9e5878 100644
  #define FAMILY_VGH 144
  #define DEVICE_ID_VGH_163F 0x163F
 diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
-index 404208bf2..9b37cb12b 100644
+index 404208bf2..6039b8024 100644
 --- a/drivers/gpu/drm/drm_edid.c
 +++ b/drivers/gpu/drm/drm_edid.c
 @@ -2242,6 +2242,10 @@ static void connector_bad_edid(struct drm_connector *connector,
@@ -2916,16 +2916,18 @@ index 404208bf2..9b37cb12b 100644
  /* Get override or firmware EDID */
  static const struct drm_edid *drm_edid_override_get(struct drm_connector *connector)
  {
-@@ -2257,6 +2261,15 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
+@@ -2257,6 +2261,17 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
  	if (!override)
  		override = drm_edid_load_firmware(connector);
  
 +#ifdef CONFIG_X86_PS5
-+	/* Only use real_edid (from HDMI ICC read) for HDMI connector,
-+	 * not for USB-C (DP-2) which has its own EDID source.
++	/* Use real_edid (from HDMI ICC read) for DP-1 (HDMI via DP connector)
++	 * but not for DP-2 (USB-C) which has its own EDID source.
++	 * PS5 maps HDMI through a DisplayPort connector, so we can't use
++	 * connector_type to distinguish. Check connector name instead.
 +	 */
 +	if (IS_ERR(override) && real_edid &&
-+	    connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort)
++	    strcmp(connector->name, "DP-2") != 0)
 +		override = drm_edid_dup(real_edid);
 +#endif
 +
