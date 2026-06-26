@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..b655055c2 100644
+index a3cb05490..20a4192b9 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1927,7 +1927,7 @@ index a3cb05490..b655055c2 100644
 +		drm_edid_connector_update(connector, drm_edid);
 +
 +		if (!drm_edid)
-+			return EDID_NO_EDID;
++			return EDID_NO_RESPONSE;
 +
 +		edid = drm_edid_raw(drm_edid);
 +		if (!edid ||
