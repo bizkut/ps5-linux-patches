@@ -1,0 +1,746 @@
+# PS5 USB-C DisplayPort Alt Mode - Development Progress
+
+## Overview
+Enabling USB-C DisplayPort alt mode on PS5 Linux. The PS5 has two display outputs:
+- **DP-1** (HDMI via FLAVA3 IC, UNIPHY_A, enum_id=1)
+- **DP-2** (USB-C DP alt mode, UNIPHY_B/combo PHY, enum_id=2)
+
+Both are reported as `CONNECTOR_ID_DISPLAY_PORT` by VBIOS.
+
+## Architecture
+
+### USB-C ICC Driver (`drivers/ps5/usbc.c`)
+Communicates with the PS5 PD controller via ICC (Inter-Chip Communication)
+messages over the spcie bus.
+
+**Key ICC message types (from PS5 5.50 firmware reverse engineering):**
+| Message | msg_type | Purpose |
+|---------|----------|---------|
+| GET_SERVICE_STATE | 0x00 | Get service state |
+| GET_PORT_LIST | 0x01 | Get port list |
+| GET_DEV_CONN_STATE | 0x0c | Get device connection state |
+| SET_PDCON_OP_MODE | 0x10 | Set PD controller op mode |
+| GET_PDCON_OP_MODE | 0x11 | Get PD controller op mode |
+| NOTIFY_SOC_WORKING | 0x15 | Notify SOC working |
+| NOTIFY_SOC_DOWNLOAD_STANDBY | 0x16 | Notify SOC standby |
+| SET_SUPPORTED_DEVICE_LIST | 0x19 | Set supported device list |
+| GET_PDCON_IC_TYPE | 0x1b | Get PD controller IC type |
+| GET_PDCON_FW_VER | 0x1c | Get PD controller firmware version |
+| SET_AUTO_POWER_ON_VR_HEADSET | 0x1d | Auto power on VR headset |
+| SET_REDRIVER_EQVAL | 0x20 | Set redriver EQ value |
+| SET_OPT_PDP_ENABLE | 0x12 | Enable DP power delivery (data[1]: 1=enable, 2=alt) |
+
+**SET_OPT_PDP_ENABLE** (msg_type 0x12, confirmed from firmware disassembly):
+- data[0] = port_id
+- data[1] = enable (1 = enable, 2 = also accepted, meaning unclear)
+- This command enables DP power delivery on the USB-C port
+- Called after SET_PDCON_OP_MODE in the USBC driver init sequence
+- The firmware validates enable: only 1 or 2 are accepted, other values return error
+
+**GET_DEV_CONN_STATE reply structure (12 bytes after 2-byte status header):**
+```
+[0] PortId    [1] ConnState   [2] DevType   [3] VconnReq
+[4] Power     [5] Mux         [6] Orient    [7] DpAlt
+[8] PinAssign [9] Hpd
+```
+
+### HPD (Hot Plug Detect) Flow
+1. USBC driver polls PD controller at 500ms intervals
+2. Detects `DpAlt=1` and `ConnState=1` → fires `PS5_USBC_HPD_CONNECT`
+3. Uses dedicated unbound workqueue (`ps5_usbc_hpd`) for HPD events
+4. amdgpu registers callback via `ps5_usbc_register_hpd_callback()`
+5. Callback fires initial CONNECT if device already connected at boot
+   (USBC driver loads before amdgpu)
+
+### amdgpu Integration
+- **`bios_parser2.c`**: Injects USB-C DP connector if VBIOS only defines HDMI
+- **`link_factory.c`**: Sets `DP_IS_USB_C` and `usbc_combo_phy` for enum_id=2
+- **`link_ddc.c`**: VBIOS maps USB-C to DDC2 (i2c_line=1)
+- **`amdgpu_dm.c`**: 
+  - Registers HPD callback
+  - Uses `force=DRM_FORCE_ON` on CONNECT to trigger `emulated_link_detect`
+  - Sets DDC transaction type and aux_mode in `emulated_link_detect`
+  - Calls `acquire_phy` before EDID read in `emulated_link_detect`
+  - Skips HDMI-specific mute methods for USB-C (enum_id=2)
+
+## Current Status
+
+### Working
+- USB-C ICC communication with PD controller
+- DP alt mode detection (DpAlt=1, ConnState=1)
+- HPD CONNECT/DISCONNECT event firing
+- amdgpu callback registration and connector detection
+- DP-2 connector created and shows `connected` status
+- DPMS on, framebuffer console active on HDMI
+- No kernel crash (dc_helper.c ASSERT fixed)
+- Combo PHY registers correctly mapped (RDPCSTX1 offsets)
+- `acquire_phy` succeeds: DPALT_DISABLE=0, REF_CLK_EN=1
+- AUX engine correctly selected (en=1, AUX1 for USB-C)
+- AUX engine enabled (AUX_EN=1)
+- AUX_HPD_SEL corrected from HPD1 to HPD2
+- AUX transaction mode confirmed (aux_mode=1, transaction_type=2)
+- DDC adapter non-NULL for DP-2 EDID read
+
+### Not Working
+- **AUX transactions to USB-C display fail with TIMEOUT**
+  - `EDID status=0` (EDID_NO_EDID)
+  - AUX transfer to DPCD 0x0218 retried ~32 times, all fail
+  - `operation_result=3` (AUX_RET_ERROR_TIMEOUT) — AUX signal not reaching display
+  - Root cause: combo PHY held in RESET + HDMI mode by PS5 firmware
+  - Fix in progress: clear `RDPCS_PHY_RESET` and `RDPCS_PHY_HDMIMODE_ENABLE`
+    in `acquire_phy` to switch PHY to DP mode and take out of reset
+
+## Register State (Latest Boot)
+
+Combo PHY (RDPCSTX1) register dump from `acquire_phy`:
+```
+CNTL0  = 0x10108705
+CNTL2  = 0x00000006
+CNTL5  = 0x030c030c
+CNTL6  = 0x030c030c
+CNTL11 = 0x00201643
+```
+
+CNTL0 decoded (CRITICAL — PHY in reset + HDMI mode):
+| Bit | Field | Value | Meaning |
+|-----|-------|-------|---------|
+| 0 | RDPCS_PHY_RESET | 1 | **PHY IN RESET** |
+| 2 | RDPCS_PHY_TCA_APB_RESET_N | 1 | APB reset released |
+| 8 | RDPCS_PHY_HDMIMODE_ENABLE | 1 | **HDMI MODE (not DP)** |
+| 9:13 | RDPCS_PHY_REF_RANGE | 3 | Reference range |
+| 16:18 | RDPCS_PHY_TX_VBOOST_LVL | 4 | TX voltage boost |
+| 20 | RDPCS_PHY_CR_PARA_SEL | 1 | CR parallel select |
+
+CNTL6 decoded:
+| Bit | Field | Value | Meaning |
+|-----|-------|-------|---------|
+| 16 | DPALT_DP4 | 0 | 2-lane DP (not 4-lane) |
+| 17 | DPALT_DISABLE | 0 | Alt mode enabled |
+| 18 | DPALT_DISABLE_ACK | 1 | ACK set |
+| 19 | DP_REF_CLK_EN | 1 | Ref clock enabled |
+
+AUX engine (DP_AUX1) register dump:
+```
+AUX_CONTROL           = 0x01140000 (before fix)
+AUX_DPHY_RX_CONTROL0  = 0x103d1010
+AUX_DPHY_TX_CONTROL   = 0x00021c7a
+```
+
+AUX DPHY TX/RX controls match DCN20 defaults — no fix needed.
+
+AUX_CONTROL decoded (before fix):
+| Bit | Field | Value | Meaning |
+|-----|-------|-------|---------|
+| 0 | AUX_EN | 0 | AUX engine NOT enabled |
+| 4 | AUX_RESET | 0 | Not in reset |
+| 5 | AUX_RESET_DONE | 0 | Reset not done |
+| 16 | AUX_IGNORE_HPD_DISCON | 0 | HPD disconnect check active |
+| 18 | AUX_MODE_DET_EN | 1 | Mode detection enabled |
+| 20:21 | AUX_HPD_SEL | 1 | HPD1 (wrong — should be HPD2) |
+| 24 | AUX_IMPCAL_REQ_EN | 1 | Impedance cal enabled |
+
+AUX_CONTROL after fix:
+```
+AUX_CONTROL = 0x01250001 (AUX_EN=1, HPD_SEL=2, IGNORE_HPD_DISCON=1)
+```
+
+| Bit | Field | Fixed Value | Meaning |
+|-----|-------|-------------|---------|
+| 0 | AUX_EN | 1 | AUX engine enabled |
+| 16 | AUX_IGNORE_HPD_DISCON | 1 | Bypass physical HPD check |
+| 20:21 | AUX_HPD_SEL | 2 | HPD2 (USB-C) |
+
+CNTL0 after fix (expected):
+```
+CNTL0 = 0x10108604 (RDPCS_PHY_RESET=0, RDPCS_PHY_HDMIMODE_ENABLE=0)
+```
+
+Alt mode is enabled, ref clock is on, AUX engine is enabled with correct
+HPD selection and HPD disconnect bypass. PHY needs to be switched from
+HDMI to DP mode and taken out of reset.
+
+## Root Cause Analysis
+
+### DDC/AUX Channel Routing
+The PS5 GPU (DCN2.0.1 / renoir) has:
+- 2 DDC channels: DDC1 (HDMI), DDC2 (USB-C)
+- 2 AUX engines: AUX0 (engines[0]), AUX1 (engines[1])
+- 2 RDPCSTX PHYs: RDPCSTX0 (HDMI/UNIPHY_A), RDPCSTX1 (USB-C/UNIPHY_B/combo PHY)
+
+The VBIOS correctly maps USB-C connector (enum_id=2) to DDC2 (i2c_line=1).
+The AUX engine selection uses `engines[ddc_pin->pin_data->en]` where `en=1`
+for DDC2, selecting AUX1.
+
+### The Problem — Three Independent AUX Issues Found
+
+The combo PHY (RDPCSTX1) is in alt mode with ref clock enabled, but AUX
+transactions failed. Three independent issues were identified and fixed:
+
+**Issue 1: AUX engine not enabled (AUX_EN=0)**
+The AUX1 engine for USB-C was never powered on. The `dcn10_aux_initialize`
+function only sets `AUX_HPD_SEL` and `AUX_RX_RECEIVE_WINDOW` — it does NOT
+set `AUX_EN`. The AUX engine is normally enabled on-demand in
+`dce_aux_transfer_raw` → `acquire()`, but this only happens if the AUX
+engine is properly acquired. For the emulated detect path, the AUX engine
+was not being acquired early enough.
+
+Fix: Set `AUX_EN=1` in `acquire_phy` before the EDID read.
+
+**Issue 2: Wrong HPD source (AUX_HPD_SEL=1 instead of 2)**
+The VBIOS set `AUX_HPD_SEL=1` (HPD1, the HDMI HPD line) for the AUX1
+engine. The USB-C connector uses HPD2. When the AUX engine checks HPD
+before transactions, it checks HPD1 which is connected to the HDMI
+display, not the USB-C display. This caused `AUX_RET_ERROR_HPD_DISCON`.
+
+Fix: Set `AUX_HPD_SEL=2` (HPD2) in `acquire_phy`.
+
+**Issue 3: Physical HPD not asserted (AUX_IGNORE_HPD_DISCON=0)**
+Even with the correct HPD source (HPD2), the physical HPD2 pin is not
+asserted because the PS5 USB-C HPD is virtual — it's handled by the ICC
+PD controller, not by a physical GPIO pin to the GPU. The AUX engine
+checks the physical HPD line and rejects all transactions with
+`AUX_RET_ERROR_HPD_DISCON` when HPD is low.
+
+Fix: Set `AUX_IGNORE_HPD_DISCON=1` (bit 16) in `acquire_phy` to bypass
+the physical HPD check. This tells the AUX engine to proceed with
+transactions even when the physical HPD line is low.
+
+**Issue 4: Combo PHY in RESET + HDMI mode (RDPCS_PHY_RESET=1, RDPCS_PHY_HDMIMODE_ENABLE=1)**
+After bypassing the HPD check, AUX transfers changed from HPD_DISCON to
+TIMEOUT — the AUX engine sends the request but gets no reply. The combo
+PHY (RDPCSTX1) was found to be:
+- In RESET (`RDPCS_PHY_RESET=1` in CNTL0 bit 0)
+- In HDMI mode (`RDPCS_PHY_HDMIMODE_ENABLE=1` in CNTL0 bit 8)
+
+The PS5 firmware never initializes the USB-C combo PHY for DP since it
+doesn't use USB-C for display. The PHY is left in reset and HDMI mode
+from boot. No AUX signal can pass through a PHY that's in reset and
+configured for HDMI.
+
+Fix: In `acquire_phy`, clear `RDPCS_PHY_HDMIMODE_ENABLE` (switch to DP
+mode) and clear `RDPCS_PHY_RESET` (take PHY out of reset), with
+appropriate delays for the PHY to stabilize.
+
+**IMPORTANT**: `REG_UPDATE` macro does NOT work for CNTL0 — the write
+silently fails and the readback shows the original value. Using
+`dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0, value)` directly
+works correctly. Confirmed in boot log:
+```
+CNTL0=0x10108705 → After HDMI->DP: 0x10108605 → After reset release: 0x10108604
+```
+The `REG_UPDATE` macro uses `REG_READ` → modify → `REG_WRITE`, but
+`REG_WRITE` appears to be a no-op for this register. `dm_write_reg`
+bypasses the macro and writes directly to the MMIO address.
+
+**Issue 5: PHY out of reset + DP mode, but AUX still TIMEOUT**
+After successfully clearing both RESET and HDMIMODE bits, AUX transfers
+still fail with `AUX_RET_ERROR_TIMEOUT` (operation_result=3). The PHY is
+out of reset and in DP mode, but AUX signals still don't reach the USB-C
+display. The PHY likely needs additional configuration beyond just
+reset/mode — possibly lane enable, MPLL config, or AUX DPHY TX/RX
+calibration. See "Next Steps" for investigation paths.
+
+### AUX Transfer Path (Confirmed Working for DP-1/HDMI)
+
+The AUX transfer path was traced with debug logging in `dce_aux_transfer_raw`:
+1. `dm_helpers_read_local_edid` → checks `link->aux_mode`
+2. If `aux_mode=1`: uses `aconnector->dm_dp_aux.aux.ddc` (AUX adapter)
+3. `drm_edid_read_ddc` → `drm_dp_i2c_transfer` → `dce_aux_transfer_with_retries`
+4. `dce_aux_transfer_raw`:
+   - Gets AUX engine: `engines[ddc_pin->pin_data->en]`
+   - `acquire(aux_engine, ddc_pin)` — enables AUX engine if needed
+   - `submit_channel_request` — sends AUX request
+   - `get_channel_status` — polls `AUX_SW_STATUS` for `AUX_SW_DONE`
+   - Checks `AUX_SW_HPD_DISCON` — returns `AUX_RET_ERROR_HPD_DISCON` if HPD low
+
+For DP-1 (HDMI): `en=0`, all transfers succeed (operation_result=0)
+For DP-2 (USB-C): `en=1`, transfers progressed through four failure modes:
+- Initially: `AUX_RET_ERROR_HPD_DISCON` (4) — wrong HPD source + HPD check active
+- After HPD_SEL + IGNORE_HPD_DISCON fix: `AUX_RET_ERROR_TIMEOUT` (3) — PHY in reset
+- After PHY reset/mode fix (dm_write_reg): still `AUX_RET_ERROR_TIMEOUT` (3)
+  — PHY is out of reset + in DP mode, but needs additional configuration
+- Next: investigate PHY lane enable, MPLL, AUX DPHY TX/RX calibration
+
+### Combo PHY DP Alt Mode — Register Layout
+
+**IMPORTANT**: All DPALT bits and DP_REF_CLK_EN are in `RDPCSTX_PHY_CNTL6`
+on DCN201 (same as DCN20/DCN21). The original DCN201 header incorrectly
+mapped them to `PHY_CNTL2` and `PHY_CNTL11`.
+
+| Field | Register | Bit | Mask |
+|-------|----------|-----|------|
+| RDPCS_PHY_DPALT_DISABLE | PHY_CNTL6 | 17 | 0x00020000 |
+| RDPCS_PHY_DPALT_DISABLE_ACK | PHY_CNTL6 | 18 | 0x00040000 |
+| RDPCS_PHY_DPALT_DP4 | PHY_CNTL6 | 16 | 0x00010000 |
+| RDPCS_PHY_DP_REF_CLK_EN | PHY_CNTL6 | 19 | 0x00080000 |
+
+Register offsets (from `dpcs_2_0_3_offset.h`):
+- RDPCSTX0_PHY_CNTL6: 0x2946
+- RDPCSTX1_PHY_CNTL6: 0x2a1e
+
+### Critical Bug: Missing Register Offset Mapping
+
+`link_regs` in `dcn201_resource.c` was missing `DPCS_DCN2_CMN_REG_LIST(id)`.
+Without it, all RDPCSTX register offsets were 0 — every `REG_READ`/`REG_GET`/
+`REG_UPDATE` on combo PHY registers was hitting offset 0 instead of the actual
+register. This caused:
+- All registers read the same value (`0x00058184` = whatever is at offset 0)
+- `DPALT_DISABLE = 0` was a false read from offset 0
+- `acquire_phy` writes went to offset 0 (no effect on actual PHY)
+
+**Fix**: Added `DPCS_DCN2_CMN_REG_LIST(id)` to `link_regs`, plus `#define`
+stubs for 6 missing register offsets (PHY_FUSE0-3, DEBUG_CONFIG) that exist
+in `dpcs_2_0_0` but not `dpcs_2_0_3`.
+
+### Critical Bug: Missing Mask/Shift Definitions
+
+`dpcs_2_0_3_sh_mask.h` (used by DCN201) lacks DPALT and DP_REF_CLK_EN
+field definitions. They only exist in `dpcs_2_0_0_sh_mask.h`. This caused:
+
+1. `le_shift`/`le_mask` structs had mask=0 for all DPALT fields
+2. `REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value)` always
+   returned 0 (mask=0 → no bits extracted)
+3. `is_in_alt_mode()` always returned `true` (false positive)
+4. `REG_UPDATE` triggered `ASSERT(mask != 0)` crash in `dc_helper.c:100`
+
+**Fix**: Added `#define` statements in `dcn201_resource.c` for the 4
+missing shift/mask values, and added `LE_SF` entries to
+`LINK_ENCODER_MASK_SH_LIST_DCN201`.
+
+### Critical Bug: DPCS Mask List Not Used
+
+`LINK_ENCODER_MASK_SH_LIST_DCN20` (used by DCN201) does NOT include
+`DPCS_MASK_SH_LIST` which has the DPALT fields. The
+`DPCS_DCN201_MASK_SH_LIST` macro existed in the header but was never
+referenced. Fixed by adding the 4 DPALT `LE_SF` entries directly to
+`LINK_ENCODER_MASK_SH_LIST_DCN201` in `dcn201_resource.c`.
+
+## Important: USB-C Port is PSVR2-Only
+
+The PS5's USB-C port is used exclusively for **PSVR2 (VR headset)** in the
+original PS5 OS. This has major implications:
+
+- The **VBIOS likely does not fully initialize the USB-C DP path** — it's
+  expected to be configured by the OS-level VR driver at runtime
+- The **combo PHY (RDPCSTX1) may not be in DP alt mode** at boot — the PS5
+  OS would configure it when PSVR2 is detected
+- The **AUX channel routing** may require explicit PHY configuration that
+  the PS5 OS performs but Linux does not
+- The PD controller negotiates DP alt mode (DpAlt=1) but the GPU side
+  (combo PHY) may not be configured to match
+
+### What the PS5 OS likely does:
+1. PD controller detects PSVR2 connection → DP alt mode negotiation
+2. OS VR driver configures RDPCSTX1 for DP alt mode (clears DPALT_DISABLE)
+3. OS configures combo PHY AUX routing
+4. OS performs DP link training and EDID read via AUX
+
+### What Linux is missing:
+- Step 2: RDPCSTX1 register configuration for DP alt mode (partially done)
+- Possibly step 3: AUX routing configuration
+
+## PS5 5.50 Kernel Dump Reference
+
+Location: `/Users/bizkut/Downloads/PS5/FIRMWARE_FILES/5.50/5.50-kv-dump/`
+
+### Dump Structure
+- `raw/` — Raw `/dev/mem` extractions from reserved physical dump buffers
+  - `kernel_550_ktext_64m.bin` (64MB, pass1, ktext=0xffffffff9a9e0000)
+  - `kernel_550_ktext_next.bin` (128MB, pass2, ktext=0xffffffffd8880000)
+- `parsed/pass1/` — Parsed ranges from pass1 (6 ranges)
+- `parsed/pass2/` — Parsed ranges from pass2 (2 ranges)
+- `merged/kernel_550_merged_by_offset.bin` — ASLR-neutral merged image (194MB)
+- `scripts/` — Helper scripts for parsing, merging, scanning, disassembly
+
+### Merged Image
+- Size: 0xb998000 (~194MB)
+- Merge key: `va - ktext` (ASLR-neutral)
+- Synthetic analysis base: `0xffffffff80000000`
+- Continuous coverage: offset 0x0 through 0x9780000
+- Extra isolated page: offset 0xb994000 through 0xb998000
+
+### Key Findings from Kernel Dump
+
+**VBIOS / Display-related strings found:**
+
+| String | Offset | Context |
+|--------|--------|---------|
+| `[VBIOS] DPAlt SSC OFF(ManuMode)` | 0x010136e0 | VBIOS DP alt mode spread spectrum control |
+| `[VBIOS] DPAlt SSC ON(Default)` | 0x01039cac | VBIOS DP alt mode spread spectrum default |
+| `Begin common phy init` | 0x00fd0234 | Common PHY initialization entry point |
+| `DP Phy VBIOS command Lane ACK Timeout` | 0x01034c0b | DP PHY link training timeout |
+| `enable_output` | 0x00f9dcd2 | Display output enable function |
+| `disable_output` | 0x00fc3e0a | Display output disable function |
+| `AUX[%d] read:NG` | 0x00f9dce0 | AUX read failure message |
+| `AUX[%d] read DPCD.LANE0_1_STATUS failed` | 0x00fc3e20 | DPCD link status read failure |
+| `configLinkTrainingFlava3` | 0x01029ca6 | Link training config for FLAVA3 (HDMI) |
+| `initHdmiPhyForFlava3_2nd` | 0x00fb89ba | HDMI PHY init for FLAVA3 chip |
+| `Read EDID Data : ICC Query Failed` | 0x0107a7fa | EDID read via ICC (not AUX) |
+| `Phy Initialization started` | 0x00fb413d | PHY init entry (XMAC/ethernet, not display) |
+
+**Source file paths found:**
+- `W:\Build\J02159354\sys\internal\modules\usbc\usbc.c` — USB-C driver source
+- `W:\Build\J02159354\sys\internal\modules\gc\vbios.c` — VBIOS driver source
+- `W:\Build\J02159354\sys\internal\modules\dce\regrw.c` — DCE register read/write
+- `W:\Build\J02159354\sys\internal\modules\dce\dce.c` — DCE main module
+- `W:\Build\J02159354\sys\internal\modules\av_control\dio\dp_link.c` — DP link control
+- `W:\Build\J02159354\sys\internal\modules\av_control\dio\hdcp\hdcp.c` — HDCP
+
+**VBIOS image found embedded in kernel dump:**
+- ATOM BIOS header at offset `0x07463bd7`
+- VBIOS date: `11/14/21` (November 14, 2021)
+- VBIOS version: `ATOMBIOSBK-AMD VER016.002.000.006.000000`
+- VBIOS ID: `AMD_OBR_GENERIC\config.h`
+- The VBIOS contains all RDPCSTX register names (CNTL0-CNTL14, PHY_FUSE0-3, etc.)
+- The VBIOS contains all DP_AUX register names (AUX_CONTROL, AUX_DPHY_TX/RX_CONTROL, etc.)
+
+**Register access control findings:**
+- `dcereglock` / `_dce_reglock_lock` / `_dce_reglock_unlock` — software mutex for DCE register access (not hardware protection)
+- `reglock mismatch` error messages — the lock tracks lockunit, id, tree, depth
+- `SMU private region violation` — hardware-level protection exists for SMU regions
+- `PSP private region violation` — hardware-level protection exists for PSP regions
+- `CPU save private region violation` — hardware-level protection for CPU save area
+- `DF save private region violation` — hardware-level protection for DF save area
+- No evidence of register write protection on RDPCSTX registers specifically
+- `dm_write_reg` successfully writes to CNTL0 (confirmed in boot log)
+
+**ICC (Inter-Chip Communication) display commands found:**
+- `Read EDID Data : ICC Query Failed` — EDID read via ICC
+- `Get DP Link Status : ICC Query Failed` — DP link status via ICC
+- `Read DP Reset Status : ICC Query Failed` — DP reset status via ICC
+- `getDisplayPortEqualizerStatus : ICC Query Failed` — DP equalizer via ICC
+- These suggest the PS5 firmware reads EDID and DP status through ICC to the
+  south bridge (Belize), not through standard AUX channel
+
+**USBC PD controller commands found:**
+- `SET_OPT_PDP_ENABLE` — Enable/disable DP power delivery
+- `SET_PDCON_OP_MODE` — Set PD controller operation mode
+- `SET_REDRIVER_EQVAL` — Set redriver equalizer value
+- `GET_DEV_CONN_STATE` — Get device connection state (DpAlt, PinAssign, HPD, Mux)
+- `NOTIFY_SOC_WORKING` / `NOTIFY_SOC_DOWNLOAD_STANDBY` — SOC state notifications
+
+**Register offset tables:**
+- RDPCSTX1 register offsets found at 0x130b780 (table of 0x2a01-0x2a33 range)
+- Register descriptor table at 0x7bc7290 (format: `25 <offset> 00 00 00 80`)
+
+**Key observations:**
+1. The PS5 firmware has VBIOS-level DP alt mode SSC control
+2. "Begin common phy init" is the PHY init entry point (ethernet PHY, not display)
+3. The display PHY init goes through VBIOS command tables, not direct register writes
+4. EDID read in PS5 firmware goes through ICC queries, not standard AUX
+5. The FLAVA3 HDMI chip has its own PHY init sequence (`initHdmiPhyForFlava3_2nd`)
+6. Link training is configured via `configLinkTrainingFlava3` (HDMI-specific)
+7. The VBIOS is embedded in the kernel dump at offset 0x07463bd7
+8. `dm_write_reg` works for CNTL0 — the register is NOT hardware-protected
+9. The `REG_UPDATE` macro silently fails for CNTL0 — likely a mask/shift issue
+10. The PS5 may use ICC for EDID reads instead of AUX, but AUX should still work
+    if the PHY is properly configured for DP mode
+
+### Analysis Scripts
+```sh
+# Parse raw dumps
+python scripts/parse_post_hv_dump.py raw/kernel_550_ktext_64m.bin --out-dir parsed/pass1
+
+# Merge dumps by va - ktext
+python scripts/merge_post_hv_dumps.py raw/kernel_550_ktext_64m.bin raw/kernel_550_ktext_next.bin \
+  --out merged/kernel_550_merged_by_offset.bin --manifest merged/kernel_550_merged_manifest.txt
+
+# Search for strings
+python -c "
+with open('merged/kernel_550_merged_by_offset.bin', 'rb') as f:
+    data = f.read()
+pos = data.find(b'Begin common phy init')
+print(f'Found at offset 0x{pos:08x}')
+"
+
+# Search for register offset references
+python -c "
+import struct
+with open('merged/kernel_550_merged_by_offset.bin', 'rb') as f:
+    data = f.read()
+# Search for RDPCSTX1_PHY_CNTL6 (0x2a1e) as 32-bit LE value
+packed = struct.pack('<I', 0x2a1e)
+pos = data.find(packed)
+print(f'RDPCSTX1_PHY_CNTL6 reference at offset 0x{pos:08x}')
+"
+```
+
+## PS5 Linux Loader Analysis
+
+Location: `/Users/bizkut/Downloads/PS5/Linux/ps5-linux-loader/`
+
+The linux loader runs in the PS5 kernel context before booting Linux.
+It performs critical display initialization that Linux relies on.
+
+### Display Initialization in `shellcode_kernel/boot_linux.c`
+
+```c
+// 1. Copy VBIOS to legacy VGA ROM location (physical 0xC0000)
+memcpy((void *)PHYS_TO_DMAP(0xC0000), (void *)g_vbios, 0x10000);
+
+// 2. Initialize MP3 (Media Processor 3) for vmid 0
+mp3_initialize(0);
+
+// 3. Set HDCP packet for back-end 0 (HDMI)
+mp3_set_hdcp_packet(0, 1);   // cmd 21: be=0, mode=1
+
+// 4. Enable output for back-end 0 (HDMI)
+mp3_enable_output(0, 1);     // cmd 22: be=0, mode=1
+```
+
+### Key Finding: Only HDMI (be=0) is Initialized
+
+The loader only initializes **be=0 (HDMI)**. It does NOT call:
+- `mp3_initialize(1)` — for USB-C
+- `mp3_set_hdcp_packet(1, 1)` — HDCP for USB-C
+- `mp3_enable_output(1, 1)` — enable output for USB-C
+
+The `be` (back-end) parameter selects the display output:
+- be=0: HDMI (DP-1, FLAVA3 IC, UNIPHY_A)
+- be=1: USB-C (DP-2, combo PHY, UNIPHY_B)
+
+### MP3 (Media Processor 3)
+
+MP3 is a Trusted Application (TA) running on the PSP (Platform Security
+Processor). It handles:
+- HDCP packet setting (command 21)
+- Display output enable (command 22)
+- ScanIn/ScanOut region management
+
+MP3 communicates via `mp3_invoke(cmd_id, req, rsp)`:
+- `fun_mp3_initialize` — offset varies by firmware (e.g., 0x980BF0 on 5.50)
+- `fun_mp3_invoke` — offset varies by firmware (e.g., 0x97FA10 on 5.50)
+
+The `g_vbios` global is at offset 0x0734B5D0 (varies by firmware).
+The VBIOS is 64KB (0x10000 bytes) and is copied to physical 0xC0000.
+
+### VBIOS Copy
+
+The loader copies the VBIOS from the PS5 kernel's `g_vbios` global to
+physical address 0xC0000 (legacy VGA ROM location). This is the VBIOS
+that Linux's amdgpu driver reads for ATOM BIOS command tables.
+
+The e820 memory map marks 0xC0000-0x100000 as `E820_TYPE_RESERVED` for VBIOS.
+
+### Impact on USB-C DP Alt Mode
+
+The MP3 `enable_output` command may configure the display pipeline at the
+system level, including:
+1. Enabling the display back-end (scanout, video format)
+2. Setting up HDCP
+3. Possibly configuring the PHY through VBIOS command tables
+
+Without calling `mp3_enable_output(1, 1)` for USB-C, the display back-end
+may not be fully enabled, which could explain why AUX transactions time out
+even after the PHY is taken out of reset and switched to DP mode.
+
+### Possible Fix: Initialize USB-C in the Loader
+
+Add to `shellcode_kernel/boot_linux.c` after HDMI initialization:
+```c
+mp3_set_hdcp_packet(1, 1);   // HDCP for USB-C
+mp3_enable_output(1, 1);     // enable output for USB-C
+```
+
+This would enable the USB-C display back-end at the MP3 level, which may
+configure the PHY and AUX path properly.
+
+**DONE**: Added `mp3_set_hdcp_packet(1, 1)` and `mp3_enable_output(1, 1)`
+to `shellcode_kernel/boot_linux.c` after the HDMI initialization.
+
+### SET_OPT_PDP_ENABLE ICC Command (Implemented)
+
+Disassembly of the PS5 5.50 firmware confirmed a new ICC USBC command:
+- **SET_OPT_PDP_ENABLE** (msg_type 0x12)
+- data[0] = port_id, data[1] = enable (1 or 2)
+- Enables DP power delivery on the USB-C port
+- Found at firmware offset 0xa6f396 (msg_type assignment)
+
+This command was missing from the USBC driver. It has been added:
+- `ps5_usbc_set_opt_pdp_enable()` function in `drivers/ps5/usbc.c`
+- Called in the init sequence after `SET_PDCON_OP_MODE`
+- Module parameter `opt_pdp_enable` (default 1) controls the enable value
+
+### HV Shellcode VRAM Configuration
+
+The HV shellcode (`shellcode_hv/boot_linux.c`) configures VRAM:
+- Sets `RCC_CONFIG_MEMSIZE`, `GCMC_VM_FB_OFFSET`, etc.
+- Configures whitelist addresses for DCHUBBUB and MMHUBBUB
+- Sets up e820 memory map
+
+This is GPU-level configuration and applies to both HDMI and USB-C.
+
+## Combo PHY + AUX Engine Acquisition (Implemented)
+
+Added `dcn201_link_encoder_acquire_phy()` based on DCN21's
+`dcn21_link_encoder_acquire_phy()`. All DPALT bits and REF_CLK_EN are in
+`PHY_CNTL6` on DCN201 (same as DCN20/DCN21).
+
+The `acquire_phy` function performs three major tasks:
+
+### Combo PHY (RDPCSTX1) Mode & Reset Configuration
+1. For non-USB-C: enables `DP_REF_CLK_EN`, returns true
+2. For USB-C: dumps CNTL0/CNTL2/CNTL5/CNTL6/CNTL11 registers
+3. Reads `RDPCSTX_PHY_CNTL0`:
+   - If `RDPCS_PHY_HDMIMODE_ENABLE=1`: clears it to switch to DP mode,
+     waits 100us
+   - If `RDPCS_PHY_RESET=1`: clears it to take PHY out of reset,
+     waits 1ms for stabilization
+   - Reads back CNTL0 to verify
+4. Reads `RDPCS_PHY_DPALT_DISABLE`
+   - If 1 (disabled): writes 0 to enable, waits 100us, verifies
+   - Writes `RDPCS_PHY_DPALT_DISABLE_ACK = 0` to acknowledge
+   - Verifies alt mode still active
+5. Enables DP reference clock via `RDPCS_PHY_DP_REF_CLK_EN = 1`
+
+RDPCSTX_PHY_CNTL0 fields manipulated:
+| Bit | Field | Value | Purpose |
+|-----|-------|-------|---------|
+| 0 | RDPCS_PHY_RESET | 0 | Take PHY out of reset |
+| 8 | RDPCS_PHY_HDMIMODE_ENABLE | 0 | Switch from HDMI to DP mode |
+
+### AUX Engine (DP_AUX1) Configuration
+1. Dumps `AUX_CONTROL`, `AUX_DPHY_RX_CONTROL0`, `AUX_DPHY_TX_CONTROL`
+2. Fixes `AUX_HPD_SEL` (bits 20:21): changes from 1 (HPD1/HDMI) to
+   2 (HPD2/USB-C) — VBIOS incorrectly assigns HPD1 to USB-C AUX engine
+3. Sets `AUX_IGNORE_HPD_DISCON` (bit 16): bypasses physical HPD check
+   — PS5 USB-C HPD is virtual (ICC PD controller), not a physical GPIO
+4. Sets `AUX_EN` (bit 0): enables the AUX engine
+5. Writes updated `AUX_CONTROL`, waits 100us, reads back to verify
+
+AUX_CONTROL register fields manipulated:
+| Bit | Field | Value | Purpose |
+|-----|-------|-------|---------|
+| 0 | AUX_EN | 1 | Enable AUX engine |
+| 16 | AUX_IGNORE_HPD_DISCON | 1 | Bypass physical HPD check |
+| 20:21 | AUX_HPD_SEL | 2 | Select HPD2 (USB-C) |
+
+`acquire_phy`/`release_phy` are called from:
+- `enable_dp_output` / `disable_output` (link training path)
+- `emulated_link_detect` (EDID read path) — added to ensure
+  combo PHY is acquired before AUX EDID read
+
+### Function Pointer Exposure
+Added `acquire_phy` and `release_phy` to `struct link_encoder_funcs`
+in `link_encoder.h` so they can be called from `amdgpu_dm.c`.
+
+## Next Steps
+
+**STATUS**: PHY reset/mode fix confirmed working (dm_write_reg). AUX still TIMEOUT.
+The PHY is out of reset and in DP mode, but AUX signals still don't reach the display.
+
+1. **Investigate additional PHY configuration needed for AUX**
+   - Dump CNTL1 (PCS/PMA/ANA power enable bits) — not in register struct,
+     need to add or read by offset using `dm_write_reg`-style direct access
+   - Check CNTL3 (TX_CLK_RDY, TX_DATA_EN) — may need lane enable
+   - Check CNTL5/CNTL11/CNTL12 (MPLL) — may need DP link rate config
+   - Check if PHY needs lane enable before AUX can pass through
+   - Compare CNTL0-CNTL14 values between RDPCSTX0 (HDMI, working) and
+     RDPCSTX1 (USB-C, not working) to identify missing configuration
+
+2. **Investigate AUX DPHY TX/RX configuration**
+   - Dump `AUX_DPHY_TX_CONTROL` and `AUX_DPHY_RX_CONTROL0` for both AUX0
+     and AUX1 — compare values
+   - The AUX DPHY may need specific TX precharge or mode detection settings
+   - Check `AUX_DPHY_TX_REF_CONTROL` for reference clock configuration
+
+3. **VBIOS disassembly** (kernel dump at `0x07463bd7`)
+   - Extract the ATOM BIOS image from the kernel dump
+   - Parse the ATOM command table to find the PHY init command
+   - Look for the command that configures RDPCSTX for DP alt mode
+   - The VBIOS has `DPAlt SSC OFF/ON` control — find the full sequence
+   - Search for code near `acquire_aux_engine` string (offset 0xfe7e89)
+
+4. **If AUX transfers succeed but EDID still fails**:
+   - The USB-C display may not respond at DPCD 0x0218
+   - Try reading DPCD 0x0000 (DPCD_REV) first to verify AUX works
+   - Check if the display supports I2C-over-AUX EDID read at addr 0x50
+
+5. **If EDID read succeeds**:
+   - Verify DP-2 shows a different EDID than DP-1
+   - Attempt DP link training via `enable_dp_output`
+   - Configure display mode and enable output
+
+6. **PS5 firmware investigation**:
+   - Disassemble code around "DPAlt SSC OFF/ON" strings in kernel dump
+   - Find the VBIOS command table that configures combo PHY
+   - Look for AUX routing configuration in VBIOS
+   - Check if PS5 firmware uses ICC for EDID instead of AUX
+   - Investigate the `dce/regrw.c` register access layer
+   - Check if PS5 firmware calls `SET_OPT_PDP_ENABLE` before AUX works
+
+7. **Linux loader fix** (HIGH PRIORITY):
+   - The loader only calls `mp3_enable_output(0, 1)` for HDMI (be=0)
+   - Try adding `mp3_enable_output(1, 1)` for USB-C (be=1) in
+     `shellcode_kernel/boot_linux.c`
+   - This may configure the display back-end and PHY at the system level
+   - Also try `mp3_set_hdcp_packet(1, 1)` for USB-C HDCP
+   - The MP3 commands may trigger VBIOS PHY configuration that we can't
+     do from Linux userspace
+
+8. **Alternative approach**: Read EDID directly via i2c-1 bus
+   (USB-C display's I2C adapter) instead of through AUX
+   - Bypass AUX entirely, use raw I2C for EDID read
+   - Would not support DPCD/link training but would get correct EDID
+
+## Files Modified
+- `drivers/ps5/usbc.c` — USB-C ICC driver (new)
+- `drivers/ps5/spcie.c` — USBC notification dispatch
+- `drivers/ps5/Makefile` — Add usbc.o
+- `include/linux/ps5.h` — USBC API declarations
+- `drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c` — Connector injection
+- `drivers/gpu/drm/amd/display/dc/link/link_factory.c` — DP_IS_USB_C, alt mode log
+- `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config
+- `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c` — acquire_phy (combo PHY + AUX engine enable, HPD_SEL fix, IGNORE_HPD_DISCON), enable_dp_output, disable_output, register dumps, CNTL6 fix
+- `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h` — DPCS_DCN201_MASK_SH_LIST cleanup
+- `drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c` — DPCS_DCN2_CMN_REG_LIST in link_regs, DPALT shift/mask defines, missing register offset defines, LE_SF entries
+- `drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h` — acquire_phy/release_phy function pointers
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — EDID read debug log (aux_mode, ddc, connector)
+- `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result)
+
+## Debug Interfaces
+- `/sys/kernel/debug/ps5_usbc/conn_state` — Current connection state
+- `/sys/kernel/debug/ps5_usbc/last_notif` — Last ICC notification
+- `/sys/kernel/debug/ps5_usbc/probe` — Probe ICC message types
+- `/sys/kernel/debug/ps5_usbc/trigger_hpd` — Manually trigger HPD event
+- `/sys/class/drm/card0-DP-2/status` — Connector status
+- `/sys/class/drm/card0-DP-2/edid` — EDID binary
+- `/sys/class/drm/card0-DP-2/modes` — Available modes
+- `/sys/bus/i2c/devices/i2c-0` — DDC hw bus 0 (HDMI)
+- `/sys/bus/i2c/devices/i2c-1` — DDC hw bus 1 (USB-C DDC2)
+- `/sys/bus/i2c/devices/i2c-2` — AUX hw bus 0 (HDMI AUX)
+- `/sys/bus/i2c/devices/i2c-3` — AUX hw bus 1 (USB-C AUX1)
+
+## Key dmesg Lines to Watch
+```
+PS5:  VBIOS i2c_info for USB-C: i2c_line=1 engine=1 hw_assist=1
+PS5:  Combo PHY DP alt mode at init: ENABLED    # or DISABLED
+PS5:  Combo PHY regs: CNTL2=0x... CNTL5=0x... CNTL6=0x... CNTL11=0x...
+PS5:  Combo PHY power: CNTL0=0x...              # check RESET + HDMIMODE bits
+PS5:  PHY in HDMI mode, switching to DP mode    # if HDMIMODE_ENABLE=1
+PS5:  After HDMI->DP: CNTL0=0x...               # verify bit 8 cleared
+PS5:  PHY in reset, taking out of reset         # if PHY_RESET=1
+PS5:  After reset release: CNTL0=0x...          # verify bit 0 cleared
+PS5:  AUX_CONTROL=0x... AUX_DPHY_RX_CONTROL0=0x... AUX_DPHY_TX_CONTROL=0x...
+PS5:  Fixing AUX_HPD_SEL: 1 -> 2 (HPD2 for USB-C)
+PS5:  After AUX fix: AUX_CONTROL=0x01250001 (AUX_EN=1 HPD_SEL=2)
+PS5:  Combo PHY DPALT_DISABLE = 0                # 0=enabled, 1=disabled
+PS5:  Combo PHY acquired for DP alt mode
+PS5:  emulated_link_detect: aux_mode=1 transaction_type=2
+PS5:  emulated_link_detect: acquire_phy=1        # 1=success
+PS5:  dce_aux_transfer_raw: en=1 addr=0x... operation_result=0  # 0=success
+PS5:  emulated_link_detect: EDID status=1        # 1=EDID_OK, 0=no EDID
+```
+
+## AUX Return Codes (enum aux_return_code_type)
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0 | AUX_RET_SUCCESS | AUX process succeeded |
+| 1 | AUX_RET_ERROR_UNKNOWN | Failed with unknown reason |
+| 2 | AUX_RET_ERROR_INVALID_REPLY | Invalid reply |
+| 3 | AUX_RET_ERROR_TIMEOUT | Timed out |
+| 4 | AUX_RET_ERROR_HPD_DISCON | HPD was low during AUX process |
+| 5 | AUX_RET_ERROR_ENGINE_ACQUIRE | Failed to acquire AUX engine |
+| 6 | AUX_RET_ERROR_INVALID_OPERATION | Request not supported |
+| 7 | AUX_RET_ERROR_PROTOCOL_ERROR | Process not available |

@@ -1579,7 +1579,7 @@ index 52f4e9e09..6e4ff7444 100644
  	if (r)
  		return r;
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index f8c13bad4..7f13569a7 100644
+index f8c13bad4..378b6ede7 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -80,6 +80,10 @@
@@ -1625,7 +1625,7 @@ index f8c13bad4..7f13569a7 100644
  	link->type = dc_connection_none;
  	prev_sink = link->local_sink;
  
-@@ -3421,6 +3434,12 @@ static void emulated_link_detect(struct dc_link *link)
+@@ -3421,6 +3434,24 @@ static void emulated_link_detect(struct dc_link *link)
  		return;
  	}
  
@@ -1634,11 +1634,23 @@ index f8c13bad4..7f13569a7 100644
 +	 */
 +	set_ddc_transaction_type(link->ddc, sink_caps.transaction_type);
 +	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
++	drm_info(dev, "[PS5] emulated_link_detect: aux_mode=%d transaction_type=%d\n",
++		link->aux_mode, sink_caps.transaction_type);
++
++	/* PS5: Acquire combo PHY before EDID read for USB-C DP.
++	 * The combo PHY needs to be in DP alt mode with ref clock enabled
++	 * for AUX transactions to work. Normally this happens during
++	 * enable_dp_output, but emulated detect reads EDID before that.
++	 */
++	if (link->link_enc && link->link_enc->funcs->acquire_phy) {
++		bool acquired = link->link_enc->funcs->acquire_phy(link->link_enc);
++		drm_info(dev, "[PS5] emulated_link_detect: acquire_phy=%d\n", acquired);
++	}
 +
  	sink_init_data.link = link;
  	sink_init_data.sink_signal = sink_caps.signal;
  
-@@ -3438,6 +3457,8 @@ static void emulated_link_detect(struct dc_link *link)
+@@ -3438,6 +3469,8 @@ static void emulated_link_detect(struct dc_link *link)
  			link,
  			sink);
  
@@ -1647,7 +1659,7 @@ index f8c13bad4..7f13569a7 100644
  	if (edid_status != EDID_OK)
  		drm_err(dev, "Failed to read EDID\n");
  
-@@ -4222,8 +4243,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+@@ -4222,8 +4255,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
  	bool ret = false;
  	bool debounce_required = false;
  
@@ -1662,7 +1674,7 @@ index f8c13bad4..7f13569a7 100644
  
  	/*
  	 * In case of failure or MST no need to update connector status or notify the OS
-@@ -4243,6 +4269,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+@@ -4243,6 +4281,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
  	if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
  		drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
  
@@ -1672,7 +1684,7 @@ index f8c13bad4..7f13569a7 100644
  	/*
  	 * Check for HDMI disconnect with debounce enabled.
  	 */
-@@ -4315,6 +4344,81 @@ static void handle_hpd_irq(void *param)
+@@ -4315,6 +4356,81 @@ static void handle_hpd_irq(void *param)
  
  }
  
@@ -1754,7 +1766,7 @@ index f8c13bad4..7f13569a7 100644
  static void schedule_hpd_rx_offload_work(struct amdgpu_device *adev, struct hpd_rx_irq_offload_work_queue *offload_wq,
  							union hpd_irq_data hpd_irq_data)
  {
-@@ -4479,6 +4583,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
+@@ -4479,6 +4595,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
  	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
  	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
  
@@ -1768,7 +1780,7 @@ index f8c13bad4..7f13569a7 100644
  	if (dc_is_dmub_outbox_supported(adev->dm.dc)) {
  		if (!register_dmub_notify_callback(adev, DMUB_NOTIFICATION_HPD,
  			dmub_hpd_callback, true)) {
-@@ -6880,6 +6991,12 @@ static void fill_stream_properties_from_drm_display_mode(
+@@ -6880,6 +7003,12 @@ static void fill_stream_properties_from_drm_display_mode(
  
  	stream->output_color_space = get_output_color_space(timing_out, connector_state);
  	stream->content_type = get_output_content_type(connector_state);
@@ -1781,7 +1793,7 @@ index f8c13bad4..7f13569a7 100644
  }
  
  static void fill_audio_info(struct audio_info *audio_info,
-@@ -8269,6 +8386,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+@@ -8269,6 +8398,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
  	 */
  	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
  
@@ -1793,7 +1805,7 @@ index f8c13bad4..7f13569a7 100644
  	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
  			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
  		return result;
-@@ -10957,12 +11079,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+@@ -10957,12 +11091,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
  	drm_atomic_helper_update_legacy_modeset_state(dev, state);
  	drm_dp_mst_atomic_wait_for_dependencies(state);
  
@@ -1876,6 +1888,22 @@ index f8c13bad4..7f13569a7 100644
  	amdgpu_dm_update_hdcp(state);
  
  	/* Handle connector state changes */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index a3cb05490..9ce2b3cb6 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -1097,6 +1097,11 @@ enum dc_edid_status dm_helpers_read_local_edid(
+ 	else
+ 		ddc = &aconnector->i2c->base;
+ 
++#ifdef CONFIG_X86_PS5
++	drm_info(connector->dev, "[PS5] dm_helpers_read_local_edid: aux_mode=%d ddc=%p connector=%s\n",
++		link->aux_mode, ddc, connector->name);
++#endif
++
+ 	if (link->dc->hwss.prepare_ddc)
+ 		link->dc->hwss.prepare_ddc(link);
+ 
 diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
 index 0e1f97332..a75f4b9e9 100644
 --- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
@@ -2074,11 +2102,281 @@ index 05991a10f..777593ddd 100644
  		    asic_id.chip_id == DEVICE_ID_NV_13DB) {
  			dc_version = DCN_VERSION_2_01;
  			break;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+index 673bb87d2..c7144160d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+@@ -575,8 +575,16 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+ 	}
+ 
+ 	aux_engine = ddc->ctx->dc->res_pool->engines[ddc_pin->pin_data->en];
++#ifdef CONFIG_X86_PS5
++	pr_info("PS5: dce_aux_transfer_raw: en=%d addr=0x%04x len=%u write=%d aux_engine=%p",
++		ddc_pin->pin_data->en, payload->address, payload->length,
++		payload->write, aux_engine);
++#endif
+ 	if (!acquire(aux_engine, ddc_pin)) {
+ 		*operation_result = AUX_RET_ERROR_ENGINE_ACQUIRE;
++#ifdef CONFIG_X86_PS5
++		pr_info("PS5: dce_aux_transfer_raw: FAILED to acquire aux engine");
++#endif
+ 		return -1;
+ 	}
+ 
+@@ -595,6 +603,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+ 	submit_channel_request(aux_engine, &aux_req);
+ 	*operation_result = get_channel_status(aux_engine, &returned_bytes);
+ 
++#ifdef CONFIG_X86_PS5
++	pr_info("PS5: dce_aux_transfer_raw: operation_result=%d returned_bytes=%u",
++		*operation_result, returned_bytes);
++#endif
++
+ 	if (*operation_result == AUX_RET_SUCCESS) {
+ 		int __maybe_unused bytes_replied = 0;
+ 
 diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
-index 9459e8f28..063e4a4ee 100644
+index 9459e8f28..8612b98ef 100644
 --- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
 +++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
-@@ -98,8 +98,11 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+@@ -33,6 +33,11 @@
+ 
+ #include "gpio_service_interface.h"
+ 
++#ifdef CONFIG_X86_PS5
++#include <linux/delay.h>
++#include <linux/printk.h>
++#endif
++
+ #define CTX \
+ 	enc10->base.ctx
+ 
+@@ -56,7 +61,7 @@ static void dcn201_link_encoder_get_max_link_cap(struct link_encoder *enc,
+ 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
+ 
+ 	dcn10_link_encoder_get_max_link_cap(enc, link_settings);
+-	REG_GET_2(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value1,
++	REG_GET_2(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value1,
+ 		 RDPCS_PHY_DPALT_DP4, &value2);
+ 	/*limit to combo_phy*/
+ 	if (enc->usbc_combo_phy) {
+@@ -70,12 +75,198 @@ static bool dcn201_link_encoder_is_in_alt_mode(struct link_encoder *enc)
+ 	uint32_t value;
+ 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
+ 
+-	REG_GET(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value);
++	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
+ 
+ 	// if value == 1 alt mode is disabled, otherwise it is enabled
+ 	return !value;
+ }
+ 
++#ifdef CONFIG_X86_PS5
++/* PS5: Acquire combo PHY for USB-C DP alt mode.
++ * On PS5, the USB-C port is PSVR2-only and the firmware may not
++ * configure the combo PHY for DP alt mode. This function:
++ * 1. Checks if DP alt mode is enabled (RDPCS_PHY_DPALT_DISABLE == 0)
++ * 2. If not, tries to enable it by clearing DPALT_DISABLE
++ * 3. Acknowledges alt mode (DPALT_DISABLE_ACK = 0)
++ * 4. Enables DP reference clock (DP_REF_CLK_EN = 1)
++ * Based on dcn21_link_encoder_acquire_phy. DPALT bits and REF_CLK_EN
++ * are all in PHY_CNTL6 on DCN201 (same as DCN20/DCN21).
++ */
++static bool dcn201_link_encoder_acquire_phy(struct link_encoder *enc)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++	uint32_t value, cntl2, cntl5, cntl6, cntl11;
++
++	if (!enc->features.flags.bits.DP_IS_USB_C) {
++		/* Non-USB-C: just enable DP ref clock */
++		REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
++		return true;
++	}
++
++	/* USB-C combo PHY: dump register state for debugging */
++	cntl2 = REG_READ(RDPCSTX_PHY_CNTL2);
++	cntl5 = REG_READ(RDPCSTX_PHY_CNTL5);
++	cntl6 = REG_READ(RDPCSTX_PHY_CNTL6);
++	cntl11 = REG_READ(RDPCSTX_PHY_CNTL11);
++	pr_info("PS5:  Combo PHY regs: CNTL2=0x%08x CNTL5=0x%08x CNTL6=0x%08x CNTL11=0x%08x",
++		cntl2, cntl5, cntl6, cntl11);
++	{
++		uint32_t cntl0;
++		cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++		pr_info("PS5:  Combo PHY power: CNTL0=0x%08x", cntl0);
++
++		/* PS5 firmware leaves USB-C combo PHY in reset + HDMI mode.
++		 * Switch to DP mode and take PHY out of reset so AUX signals
++		 * can pass through to the USB-C display.
++		 *
++		 * RDPCS_PHY_HDMIMODE_ENABLE (bit 8): 1=HDMI, 0=DP
++		 * RDPCS_PHY_RESET (bit 0): 1=reset, 0=active
++		 */
++		if (cntl0 & (1 << 8)) {
++			pr_info("PS5:  PHY in HDMI mode, switching to DP mode");
++			/* Use dm_write_reg directly — REG_UPDATE may not stick */
++			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
++				     cntl0 & ~(1 << 8));
++			udelay(100);
++			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++			pr_info("PS5:  After HDMI->DP: CNTL0=0x%08x", cntl0);
++		}
++		if (cntl0 & 0x1) {
++			pr_info("PS5:  PHY in reset, taking out of reset");
++			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
++				     cntl0 & ~0x1);
++			udelay(1000);
++			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++			pr_info("PS5:  After reset release: CNTL0=0x%08x", cntl0);
++		}
++	}
++
++	/* Also dump AUX_CONTROL register */
++	{
++		uint32_t aux_ctrl, aux_rx0, aux_tx;
++		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
++		aux_rx0 = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_RX_CONTROL0);
++		aux_tx = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_TX_CONTROL);
++		pr_info("PS5:  AUX_CONTROL=0x%08x AUX_DPHY_RX_CONTROL0=0x%08x AUX_DPHY_TX_CONTROL=0x%08x",
++			aux_ctrl, aux_rx0, aux_tx);
++
++		/* Fix AUX_HPD_SEL: USB-C uses HPD2 (source=2), but VBIOS may
++		 * have set HPD1 (source=1). AUX_HPD_SEL is bits 20:21.
++		 * Wrong HPD source causes AUX_RET_ERROR_HPD_DISCON.
++		 */
++		uint32_t hpd_sel = (aux_ctrl >> 20) & 3;
++		if (hpd_sel != 2) {
++			pr_info("PS5:  Fixing AUX_HPD_SEL: %d -> 2 (HPD2 for USB-C)", hpd_sel);
++			aux_ctrl = (aux_ctrl & ~(3 << 20)) | (2 << 20);
++		}
++
++		/* Set AUX_IGNORE_HPD_DISCON (bit 16) — PS5 USB-C HPD is
++		 * virtual (via ICC PD controller), not a physical HPD pin.
++		 * The AUX engine checks HPD before transactions and rejects
++		 * them with HPD_DISCON if HPD is low. Since the USB-C display
++		 * doesn't assert a physical HPD line, we must bypass this check.
++		 */
++		aux_ctrl |= (1 << 16);
++
++		/* Enable AUX engine if not already enabled (AUX_EN = bit 0) */
++		if (!(aux_ctrl & 0x1)) {
++			pr_info("PS5:  AUX engine not enabled, enabling now");
++			aux_ctrl |= 0x1;
++		}
++
++		/* Write updated AUX_CONTROL */
++		dm_write_reg(CTX, enc10->aux_regs->AUX_CONTROL, aux_ctrl);
++		udelay(100);
++		/* Read back to verify */
++		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
++		pr_info("PS5:  After AUX fix: AUX_CONTROL=0x%08x (AUX_EN=%d HPD_SEL=%d)",
++			aux_ctrl, aux_ctrl & 0x1, (aux_ctrl >> 20) & 3);
++	}
++
++	/* Check DP alt mode status */
++	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
++	pr_info("PS5:  Combo PHY DPALT_DISABLE = %d", value);
++
++	if (value == 1) {
++		/* DP alt mode is disabled. The combo PHY has not been
++		 * configured for DP alt mode (expected on PS5 since the
++		 * USB-C port is PSVR2-only and firmware doesn't init it).
++		 * Try to enable it by clearing DPALT_DISABLE.
++		 */
++		pr_info("PS5:  Enabling DP alt mode on combo PHY");
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE, 0);
++		udelay(100);
++
++		REG_GET(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE, &value);
++		pr_info("PS5:  After enable, DPALT_DISABLE = %d", value);
++		if (value == 1) {
++			pr_info("PS5:  Failed to enable DP alt mode (hardware refused)\n");
++			return false;
++		}
++	}
++
++	/* Acknowledge DP alt mode */
++	REG_UPDATE(RDPCSTX_PHY_CNTL6,
++			RDPCS_PHY_DPALT_DISABLE_ACK, 0);
++	udelay(40);
++
++	/* Verify alt mode is still active */
++	REG_GET(RDPCSTX_PHY_CNTL6,
++			RDPCS_PHY_DPALT_DISABLE, &value);
++	if (value == 1) {
++		pr_info("PS5:  DP alt mode disabled after ACK\n");
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
++		return false;
++	}
++
++	pr_info("PS5:  Combo PHY acquired for DP alt mode");
++
++	/* Enable DP reference clock for USB-C combo PHY */
++	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
++
++	return true;
++}
++
++static void dcn201_link_encoder_release_phy(struct link_encoder *enc)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++
++	if (enc->features.flags.bits.DP_IS_USB_C) {
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
++	}
++
++	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 0);
++}
++
++static void dcn201_link_encoder_enable_dp_output(
++	struct link_encoder *enc,
++	const struct dc_link_settings *link_settings,
++	enum clock_source_id clock_source)
++{
++	if (!dcn201_link_encoder_acquire_phy(enc)) {
++		pr_info("PS5:  Failed to acquire PHY for USB-C DP output\n");
++		return;
++	}
++
++	dcn10_link_encoder_enable_dp_output(enc, link_settings, clock_source);
++}
++
++static void dcn201_link_encoder_disable_output(
++	struct link_encoder *enc,
++	enum signal_type signal)
++{
++	dcn10_link_encoder_disable_output(enc, signal);
++
++	if (enc->features.flags.bits.DP_IS_USB_C &&
++	    dc_is_dp_signal(signal))
++		dcn201_link_encoder_release_phy(enc);
++}
++#endif
++
+ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+ 	.read_state = link_enc2_read_state,
+ 	.validate_output_with_stream =
+@@ -83,9 +274,14 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+ 	.hw_init = enc2_hw_init,
+ 	.setup = dcn10_link_encoder_setup,
+ 	.enable_tmds_output = dcn10_link_encoder_enable_tmds_output,
++#ifdef CONFIG_X86_PS5
++	.enable_dp_output = dcn201_link_encoder_enable_dp_output,
++	.disable_output = dcn201_link_encoder_disable_output,
++#else
+ 	.enable_dp_output = dcn10_link_encoder_enable_dp_output,
+-	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
+ 	.disable_output = dcn10_link_encoder_disable_output,
++#endif
++	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
+ 	.dp_set_lane_settings = dcn10_link_encoder_dp_set_lane_settings,
+ 	.dp_set_phy_pattern = dcn10_link_encoder_dp_set_phy_pattern,
+ 	.update_mst_stream_allocation_table =
+@@ -98,11 +294,18 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
  	.disable_hpd = dcn10_link_encoder_disable_hpd,
  	.is_dig_enabled = dcn10_is_dig_enabled,
  	.destroy = dcn10_link_encoder_destroy,
@@ -2090,8 +2388,60 @@ index 9459e8f28..063e4a4ee 100644
  	.get_dig_frontend = dcn10_get_dig_frontend,
  	.fec_is_active = enc2_fec_is_active,
  	.is_in_alt_mode = dcn201_link_encoder_is_in_alt_mode,
++#ifdef CONFIG_X86_PS5
++	.acquire_phy = dcn201_link_encoder_acquire_phy,
++	.release_phy = dcn201_link_encoder_release_phy,
++#endif
+ 	.get_max_link_cap = dcn201_link_encoder_get_max_link_cap,
+ 	.get_hpd_state = dcn10_get_hpd_state,
+ 	.program_hpd_filter = dcn10_program_hpd_filter,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
+index be25e8dc0..b49448b38 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
+@@ -30,13 +30,6 @@
+ 
+ #define DPCS_DCN201_MASK_SH_LIST(mask_sh)\
+ 	DPCS_MASK_SH_LIST(mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD_EN, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD_EN, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DP4, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_PSTATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX1_PSTATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_MPLL_EN, mask_sh),\
+@@ -44,8 +37,10 @@
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_WIDTH, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_RATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_WIDTH, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL11, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh)
++/* DPALT_DISABLE, DPALT_DISABLE_ACK, DPALT_DP4, DP_REF_CLK_EN
++ * are in DPCS_MASK_SH_LIST but NOT in dpcs_2_0_3_sh_mask.h.
++ * They are defined manually in LINK_ENCODER_MASK_SH_LIST_DCN201_PS5. */
+ 
+ #define DPCS_DCN201_REG_LIST(id) \
+ 	DPCS_DCN2_CMN_REG_LIST(id), \
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index 5abbf485d..fbaac888b 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -166,6 +166,9 @@ struct link_encoder_funcs {
+ 	bool (*fec_is_active)(struct link_encoder *enc);
+ 	bool (*is_in_alt_mode) (struct link_encoder *enc);
+ 
++	bool (*acquire_phy)(struct link_encoder *enc);
++	void (*release_phy)(struct link_encoder *enc);
++
+ 	void (*get_max_link_cap)(struct link_encoder *enc,
+ 		struct dc_link_settings *link_settings);
+ 
 diff --git a/drivers/gpu/drm/amd/display/dc/link/link_factory.c b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
-index ae4c4ad05..4cb46d046 100644
+index ae4c4ad05..118ab5c4e 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/link_factory.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
 @@ -620,6 +620,25 @@ static bool construct_phy(struct dc_link *link,
@@ -2109,10 +2459,10 @@ index ae4c4ad05..4cb46d046 100644
 +		link->link_enc->usbc_combo_phy = true;
 +		pr_info("PS5:  Set DP_IS_USB_C and usbc_combo_phy for USB-C connector (enum_id=2)");
 +
-+		/* Check if combo PHY is in DP alt mode */
++		/* Log combo PHY alt mode status at init */
 +		if (link->link_enc->funcs->is_in_alt_mode) {
 +			bool in_alt = link->link_enc->funcs->is_in_alt_mode(link->link_enc);
-+			pr_info("PS5:  Combo PHY DP alt mode: %s", in_alt ? "ENABLED" : "DISABLED");
++			pr_info("PS5:  Combo PHY DP alt mode at init: %s", in_alt ? "ENABLED" : "DISABLED");
 +		}
 +	}
 +#endif
@@ -2213,6 +2563,93 @@ index 782a45caa..444259795 100644
  		DC_TRACE_LEVEL_MESSAGE(DAL_TRACE_LEVEL_INFORMATION,
  							WPP_BIT_FLAG_DC_DETECTION_DP_CAPS,
  							"result=%u link_index=%u enum dce_version=%d DPCD=0x%04X min_hblank=%u branch_dev_id=0x%x branch_dev_name='%c%c%c%c%c%c'",
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
+index 02b7dc07a..a7d56d285 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
+@@ -65,6 +65,59 @@
+ #include "dpcs/dpcs_2_0_3_offset.h"
+ #include "dpcs/dpcs_2_0_3_sh_mask.h"
+ 
++/* PS5: dpcs_2_0_3 lacks several register offsets and field definitions
++ * that DCN201 needs. They exist in dpcs_2_0_0. Define them here.
++ */
++
++/* Missing register offsets (PHY_FUSE, DEBUG_CONFIG) */
++#ifndef mmRDPCSTX0_RDPCSTX_PHY_FUSE0
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0                   0x294f
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1                   0x2950
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2                   0x2951
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3                   0x2952
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG                0x293d
++#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
++#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG                  0x292e
++#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0                   0x2a27
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1                   0x2a28
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2                   0x2a29
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3                   0x2a2a
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG                0x2a15
++#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
++#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG                  0x2a06
++#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
++#endif
++
++/* PS5: dpcs_2_0_3_sh_mask.h lacks DPALT and DP_REF_CLK_EN field definitions.
++ * They exist in dpcs_2_0_0_sh_mask.h. Define them here so DPCS_MASK_SH_LIST
++ * can initialize the shift/mask structs properly for combo PHY access.
++ */
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT          0x11
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_MASK            0x00020000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT      0x12
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK_MASK        0x00040000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT              0x10
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4_MASK                0x00010000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT          0x13
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN_MASK            0x00080000L
++#endif
++
+ #include "mmhub/mmhub_2_0_0_offset.h"
+ #include "mmhub/mmhub_2_0_0_sh_mask.h"
+ #include "nbio/nbio_7_4_offset.h"
+@@ -393,7 +446,8 @@ static const struct dcn10_link_enc_hpd_registers link_enc_hpd_regs[] = {
+ #define link_regs(id, phyid)\
+ [id] = {\
+ 	LE_DCN_COMMON_REG_LIST(id), \
+-	UNIPHY_DCN2_REG_LIST(phyid) \
++	UNIPHY_DCN2_REG_LIST(phyid), \
++	DPCS_DCN2_CMN_REG_LIST(id) \
+ }
+ 
+ static const struct dcn10_link_enc_registers link_enc_regs[] = {
+@@ -402,7 +456,11 @@ static const struct dcn10_link_enc_registers link_enc_regs[] = {
+ };
+ 
+ #define LINK_ENCODER_MASK_SH_LIST_DCN201(mask_sh)\
+-	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh)
++	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DP4, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
+ 
+ static const struct dcn10_link_enc_shift le_shift = {
+ 		LINK_ENCODER_MASK_SH_LIST_DCN201(__SHIFT)
 diff --git a/drivers/gpu/drm/amd/display/include/dal_asic_id.h b/drivers/gpu/drm/amd/display/include/dal_asic_id.h
 index 92510af1b..85c9e5878 100644
 --- a/drivers/gpu/drm/amd/display/include/dal_asic_id.h
