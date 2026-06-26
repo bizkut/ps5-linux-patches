@@ -35,6 +35,10 @@ The patch is applied on top of stock Linux kernel (v7.1.y) via `git apply`.
 - HPD=0 in GET_DEV_CONN_STATE — display connected but HPD not asserted
 - Root cause: USB-C HPD is virtual (via USB PD DP_HPD VDM), not a physical pin
 
+## Git Commit Rules
+- Do NOT include AI notations in commit messages (no "Generated with Devin", "Co-Authored-By: Devin", etc.)
+- Write commit messages as a normal developer would — concise, focused on why
+
 ## Modifying linux.patch
 When making changes to the kernel source in `/Volumes/FreeBSD/linux`:
 
