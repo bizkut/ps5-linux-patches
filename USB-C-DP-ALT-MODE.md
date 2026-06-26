@@ -92,6 +92,9 @@ messages over the spcie bus.
   - PHY is out of reset and in DP mode (CNTL0=0x10108604), but AUX still times out
   - MP3 `enable_output(1,1)` in loader did NOT change PHY registers (CNTL0 unchanged)
   - MP3 likely enables display pipeline (scanout/HDCP), not PHY configuration
+  - **ROOT CAUSE**: PS5 firmware uses ICC for all display communication, NOT AUX.
+    The combo PHY doesn't route SBU to AUX1. AUX is the wrong approach for USB-C.
+  - **SOLUTION**: ICC-based EDID read implemented (see Next Steps below)
 
 ### Latest Boot Log Analysis (2026-06-26)
 ```
@@ -853,27 +856,51 @@ in `link_encoder.h` so they can be called from `amdgpu_dm.c`.
 
 ## Next Steps
 
-**STATUS** (2026-06-26): AUX approach confirmed dead-end. PS5 firmware uses ICC
-for ALL display communication (both HDMI and USB-C). AUX1 times out because
-the combo PHY likely doesn't route SBU to AUX1. Need to implement ICC-based
-EDID read matching PS5 firmware behavior.
+**STATUS** (2026-06-27): ICC-based EDID read implemented. The AUX approach
+is confirmed dead-end — PS5 firmware uses ICC for ALL display communication.
+ICC EDID read code has been added to usbc.c and wired into amdgpu_dm_helpers.c.
 
-### Highest Priority: ICC-based EDID Read
-1. **Implement ICC EDID read in spcie/usbc driver**
-   - Send ICC message via spcie bus: service_id=0x10 (HDMI), msg_type=0, data[0]=4
-   - EDID read: data[9]=0x7c, data[10]=0x00, length=0x20
-   - May need setup command first (length=0x6c with display config)
-   - The south bridge routes the read to the USB-C display
-   - Feed EDID to DRM via `drm_edid_read_custom()` or similar
+### ICC-based EDID Read — IMPLEMENTED, NEEDS TESTING
 
-2. **Test SET_OPT_PDP_ENABLE** — needs kernel rebuild
-   - Rebuild kernel with updated `linux.patch`
-   - Check dmesg for `SET_OPT_PDP_ENABLE PortId(00) Enable(1)`
-   - If it fails with port 0, try `modprobe usbc usbc_port_id=3`
+**Implementation complete:**
+1. `ps5_usbc_read_edid()` in `drivers/ps5/usbc.c`
+   - Sends ICC HDMI EDID read query (service_id=0x10, msg_type=0, data[0]=4)
+   - Query format from firmware disassembly at offset 0x0090fc87
+   - Waits for EDID via ICC notification (completion-based, 3s timeout)
+   - Also checks if EDID is in the query reply directly
 
-3. **Compare HDMI vs USB-C PHY registers** — full CNTL0-CNTL14 dump added
-   - New kernel will print HDMI (RDPCSTX0) vs USB-C (RDPCSTX1) registers
-   - May reveal if there's a PHY routing config we're missing
+2. `ps5_usbc_handle_edid_notification()` in `drivers/ps5/usbc.c`
+   - Receives EDID from ICC HDMI service notifications (data[1]==0x02)
+   - EDID data at data[4], length at data[2:3] (u16 LE)
+   - Called by `hdmi_notification_handler()` in `drivers/ps5/hdmi.c`
+
+3. `dm_helpers_read_local_edid()` in `amdgpu_dm_helpers.c`
+   - Detects USB-C DP alt mode via `link->link_enc->funcs->is_in_alt_mode()`
+   - Uses `ps5_usbc_read_edid()` instead of AUX-based `drm_edid_read_ddc()`
+   - Feeds EDID to DRM via `drm_edid_alloc()`
+
+4. DebugFS interface: `/sys/kernel/debug/ps5_usbc/read_edid`
+   - Write any value to trigger ICC EDID read
+   - EDID data printed to dmesg
+
+**Testing procedure:**
+1. Rebuild kernel with updated `linux.patch`
+2. Boot with USB-C DP alt mode display connected
+3. Check dmesg for:
+   - `Sending ICC HDMI EDID read query`
+   - `ICC EDID reply: service_id=0x10 msg_type=0x4000`
+   - `EDID from reply` or `EDID from notification` or `EDID notification timeout`
+4. If EDID is read, check `xrandr` for display modes
+5. If timeout, may need to send setup command (length=0x6c) first
+
+**Potential issues:**
+- The ICC EDID read may require a setup command (length=0x6c) before the
+  actual EDID read query. The firmware does this at offset 0x0090fbf0.
+- The south bridge may only route EDID reads to USB-C when a VR headset
+  is detected (VR headset type flag at 0x02bd97e0). A normal DP monitor
+  may not trigger this. However, the ICC command itself is not PSVR2-specific.
+- The EDID may come via ICC notification (async) rather than in the query
+  reply (sync). The implementation handles both cases.
 
 ### Medium priority
 4. **Port ID investigation**
