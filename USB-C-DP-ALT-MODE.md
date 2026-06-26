@@ -80,15 +80,64 @@ messages over the spcie bus.
 - AUX_HPD_SEL corrected from HPD1 to HPD2
 - AUX transaction mode confirmed (aux_mode=1, transaction_type=2)
 - DDC adapter non-NULL for DP-2 EDID read
+- **HDMI AUX (DP-1, en=0) fully working**: DPCD reads, EDID read, link training
+- **PHY CNTL0 writes work via dm_write_reg**: HDMI→DP mode switch + reset release confirmed
+- **Linux loader USB-C init**: `mp3_enable_output(1,1)` added and confirmed in binary
 
 ### Not Working
-- **AUX transactions to USB-C display fail with TIMEOUT**
+- **USB-C AUX transactions (DP-2, en=1) still fail with TIMEOUT**
   - `EDID status=0` (EDID_NO_EDID)
   - AUX transfer to DPCD 0x0218 retried ~32 times, all fail
   - `operation_result=3` (AUX_RET_ERROR_TIMEOUT) — AUX signal not reaching display
-  - Root cause: combo PHY held in RESET + HDMI mode by PS5 firmware
-  - Fix in progress: clear `RDPCS_PHY_RESET` and `RDPCS_PHY_HDMIMODE_ENABLE`
-    in `acquire_phy` to switch PHY to DP mode and take out of reset
+  - PHY is out of reset and in DP mode (CNTL0=0x10108604), but AUX still times out
+  - MP3 `enable_output(1,1)` in loader did NOT change PHY registers (CNTL0 unchanged)
+  - MP3 likely enables display pipeline (scanout/HDCP), not PHY configuration
+
+### Latest Boot Log Analysis (2026-06-26)
+```
+usbc: SET_PDCON_OP_MODE PortId(00) OpMode(5)         # sent to port 0
+usbc: GET_DEV_CONN_STATE [OK] PortId(03) ...          # device on port 3!
+usbc: DP alt mode active at boot
+PS5: Combo PHY DP alt mode at init: ENABLED
+PS5: dce_aux_transfer_raw: en=0 ... operation_result=0  # HDMI AUX works
+PS5: dce_aux_transfer_raw: en=0 ... operation_result=0  # (many successful transfers)
+PS5: Combo PHY power: CNTL0=0x10108705                  # PHY in reset + HDMI mode
+PS5: After HDMI->DP: CNTL0=0x10108605                   # DP mode (bit 8 cleared)
+PS5: After reset release: CNTL0=0x10108604              # Reset released (bit 0 cleared)
+PS5: After AUX fix: AUX_CONTROL=0x01250001              # AUX_EN=1 HPD_SEL=2
+PS5: Combo PHY DPALT_DISABLE = 0                        # Alt mode enabled
+PS5: Combo PHY acquired for DP alt mode
+PS5: dce_aux_transfer_raw: en=1 addr=0x0218 ... operation_result=3  # TIMEOUT x32
+PS5: emulated_link_detect: EDID status=0                # No EDID
+```
+
+### Key Issues Identified
+
+**Issue 6: Port ID mismatch (NEW)**
+- `SET_PDCON_OP_MODE` sends to PortId(00) but device reports PortId(03)
+- All ICC commands hardcoded to port_id=0
+- The PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE, so port 0 may be correct
+- But GET_DEV_CONN_STATE returns PortId=3 — the actual USB-C port is port 3
+- Fix: Added `usbc_port_id` module parameter (default 0) to test different port IDs
+- Try `modprobe usbc usbc_port_id=3` to send commands to the actual device port
+
+**Issue 7: SET_OPT_PDP_ENABLE not yet tested (NEW)**
+- New ICC command (msg_type 0x12) added to USBC driver
+- Enables DP power delivery on the USB-C port
+- Not in the current running kernel — needs rebuild via GitHub Actions
+- Called after SET_PDCON_OP_MODE in init sequence
+
+**Issue 8: HPD not asserted (Hpd=0)**
+- GET_DEV_CONN_STATE shows Hpd=0 even though device is connected (ConnState=1, DpAlt=1)
+- The USB-C display is connected and DP alt mode is negotiated, but HPD is not asserted
+- This may be normal — PS5 USB-C HPD is virtual (via ICC PD controller)
+- The AUX_IGNORE_HPD_DISCON bypass should handle this
+
+**Issue 9: MP3 enable_output doesn't configure PHY**
+- The loader now calls `mp3_enable_output(1,1)` for USB-C (be=1)
+- But PHY registers (CNTL0) are unchanged from previous boots
+- MP3 likely enables the display pipeline (scanout, HDCP) not the combo PHY
+- PHY configuration must be done in Linux kernel driver (acquire_phy)
 
 ## Register State (Latest Boot)
 
@@ -488,16 +537,19 @@ mp3_set_hdcp_packet(0, 1);   // cmd 21: be=0, mode=1
 mp3_enable_output(0, 1);     // cmd 22: be=0, mode=1
 ```
 
-### Key Finding: Only HDMI (be=0) is Initialized
+### Key Finding: Only HDMI (be=0) was Initialized (FIXED)
 
-The loader only initializes **be=0 (HDMI)**. It does NOT call:
-- `mp3_initialize(1)` — for USB-C
-- `mp3_set_hdcp_packet(1, 1)` — HDCP for USB-C
-- `mp3_enable_output(1, 1)` — enable output for USB-C
+The loader previously only initialized **be=0 (HDMI)**. It now also calls:
+- `mp3_set_hdcp_packet(1, 1)` — HDCP for USB-C (be=1)
+- `mp3_enable_output(1, 1)` — enable output for USB-C (be=1)
 
 The `be` (back-end) parameter selects the display output:
 - be=0: HDMI (DP-1, FLAVA3 IC, UNIPHY_A)
 - be=1: USB-C (DP-2, combo PHY, UNIPHY_B)
+
+**Result**: MP3 `enable_output(1,1)` did NOT change PHY registers (CNTL0
+unchanged). MP3 likely enables the display pipeline (scanout, HDCP) but
+does not configure the combo PHY. PHY configuration must be done in Linux.
 
 ### MP3 (Media Processor 3)
 
@@ -534,32 +586,34 @@ Without calling `mp3_enable_output(1, 1)` for USB-C, the display back-end
 may not be fully enabled, which could explain why AUX transactions time out
 even after the PHY is taken out of reset and switched to DP mode.
 
-### Possible Fix: Initialize USB-C in the Loader
+### USB-C Initialization in the Loader (DONE)
 
-Add to `shellcode_kernel/boot_linux.c` after HDMI initialization:
+Added to `shellcode_kernel/boot_linux.c` after HDMI initialization:
 ```c
 mp3_set_hdcp_packet(1, 1);   // HDCP for USB-C
 mp3_enable_output(1, 1);     // enable output for USB-C
 ```
 
-This would enable the USB-C display back-end at the MP3 level, which may
-configure the PHY and AUX path properly.
+**Tested**: The loader ELF was built and loaded as payload. The MP3 commands
+ran successfully (no crash), but PHY registers (CNTL0) were unchanged from
+previous boots. MP3 `enable_output` does not configure the combo PHY.
 
-**DONE**: Added `mp3_set_hdcp_packet(1, 1)` and `mp3_enable_output(1, 1)`
-to `shellcode_kernel/boot_linux.c` after the HDMI initialization.
-
-### SET_OPT_PDP_ENABLE ICC Command (Implemented)
+### SET_OPT_PDP_ENABLE ICC Command (Implemented, NOT YET TESTED)
 
 Disassembly of the PS5 5.50 firmware confirmed a new ICC USBC command:
 - **SET_OPT_PDP_ENABLE** (msg_type 0x12)
 - data[0] = port_id, data[1] = enable (1 or 2)
 - Enables DP power delivery on the USB-C port
 - Found at firmware offset 0xa6f396 (msg_type assignment)
+- Firmware validates enable: only 1 or 2 are accepted
 
 This command was missing from the USBC driver. It has been added:
 - `ps5_usbc_set_opt_pdp_enable()` function in `drivers/ps5/usbc.c`
 - Called in the init sequence after `SET_PDCON_OP_MODE`
 - Module parameter `opt_pdp_enable` (default 1) controls the enable value
+
+**Status**: Code is in `linux.patch` but not yet in a running kernel.
+Needs kernel rebuild via GitHub Actions to test.
 
 ### HV Shellcode VRAM Configuration
 
@@ -626,57 +680,49 @@ in `link_encoder.h` so they can be called from `amdgpu_dm.c`.
 
 ## Next Steps
 
-**STATUS**: PHY reset/mode fix confirmed working (dm_write_reg). AUX still TIMEOUT.
-The PHY is out of reset and in DP mode, but AUX signals still don't reach the display.
+**STATUS** (2026-06-26): PHY reset/mode fix confirmed working (dm_write_reg).
+MP3 USB-C init added to loader (no PHY effect). SET_OPT_PDP_ENABLE added to
+USBC driver (not yet tested — needs kernel rebuild). AUX still TIMEOUT.
 
-1. **Investigate additional PHY configuration needed for AUX**
-   - Dump CNTL1 (PCS/PMA/ANA power enable bits) — not in register struct,
-     need to add or read by offset using `dm_write_reg`-style direct access
-   - Check CNTL3 (TX_CLK_RDY, TX_DATA_EN) — may need lane enable
-   - Check CNTL5/CNTL11/CNTL12 (MPLL) — may need DP link rate config
-   - Check if PHY needs lane enable before AUX can pass through
-   - Compare CNTL0-CNTL14 values between RDPCSTX0 (HDMI, working) and
-     RDPCSTX1 (USB-C, not working) to identify missing configuration
+### Immediate (needs kernel rebuild via GitHub Actions)
+1. **Test SET_OPT_PDP_ENABLE** — new ICC command (msg_type 0x12) added to USBC driver
+   - Rebuild kernel with updated `linux.patch`
+   - Check dmesg for `SET_OPT_PDP_ENABLE PortId(00) Enable(1)` and success/failure
+   - If it fails with port 0, try `modprobe usbc usbc_port_id=3`
 
-2. **Investigate AUX DPHY TX/RX configuration**
-   - Dump `AUX_DPHY_TX_CONTROL` and `AUX_DPHY_RX_CONTROL0` for both AUX0
-     and AUX1 — compare values
+2. **Compare HDMI vs USB-C PHY registers** — full CNTL0-CNTL14 dump added
+   - New kernel will print `HDMI PHY CNTL0=... CNTL2=...` (RDPCSTX0, working)
+   - And `PHY CNTL0=... CNTL2=...` (RDPCSTX1, not working)
+   - Compare to identify which registers need different values
+   - Focus on CNTL3 (TX_CLK_RDY, TX_DATA_EN), CNTL5/CNTL11/CNTL12 (MPLL)
+
+### Medium priority
+3. **Port ID investigation**
+   - GET_DEV_CONN_STATE returns PortId=3 but commands send to PortId=0
+   - PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE — may be correct
+   - Test with `usbc_port_id=3` module parameter
+
+4. **AUX DPHY TX/RX configuration**
+   - Compare `AUX_DPHY_TX_CONTROL` and `AUX_DPHY_RX_CONTROL0` for AUX0 vs AUX1
    - The AUX DPHY may need specific TX precharge or mode detection settings
-   - Check `AUX_DPHY_TX_REF_CONTROL` for reference clock configuration
 
-3. **VBIOS disassembly** (kernel dump at `0x07463bd7`)
+5. **VBIOS disassembly** (kernel dump at `0x07463bd7`)
    - Extract the ATOM BIOS image from the kernel dump
    - Parse the ATOM command table to find the PHY init command
    - Look for the command that configures RDPCSTX for DP alt mode
    - The VBIOS has `DPAlt SSC OFF/ON` control — find the full sequence
-   - Search for code near `acquire_aux_engine` string (offset 0xfe7e89)
 
-4. **If AUX transfers succeed but EDID still fails**:
+6. **PS5 firmware investigation**
+   - Disassemble code around "DPAlt SSC OFF/ON" strings in kernel dump
+   - Find the VBIOS command table that configures combo PHY
+   - Check if PS5 firmware calls `SET_OPT_PDP_ENABLE` before AUX works
+   - Investigate the `dce/regrw.c` register access layer
+
+### Lower priority
+7. **If AUX transfers succeed but EDID still fails**:
    - The USB-C display may not respond at DPCD 0x0218
    - Try reading DPCD 0x0000 (DPCD_REV) first to verify AUX works
    - Check if the display supports I2C-over-AUX EDID read at addr 0x50
-
-5. **If EDID read succeeds**:
-   - Verify DP-2 shows a different EDID than DP-1
-   - Attempt DP link training via `enable_dp_output`
-   - Configure display mode and enable output
-
-6. **PS5 firmware investigation**:
-   - Disassemble code around "DPAlt SSC OFF/ON" strings in kernel dump
-   - Find the VBIOS command table that configures combo PHY
-   - Look for AUX routing configuration in VBIOS
-   - Check if PS5 firmware uses ICC for EDID instead of AUX
-   - Investigate the `dce/regrw.c` register access layer
-   - Check if PS5 firmware calls `SET_OPT_PDP_ENABLE` before AUX works
-
-7. **Linux loader fix** (HIGH PRIORITY):
-   - The loader only calls `mp3_enable_output(0, 1)` for HDMI (be=0)
-   - Try adding `mp3_enable_output(1, 1)` for USB-C (be=1) in
-     `shellcode_kernel/boot_linux.c`
-   - This may configure the display back-end and PHY at the system level
-   - Also try `mp3_set_hdcp_packet(1, 1)` for USB-C HDCP
-   - The MP3 commands may trigger VBIOS PHY configuration that we can't
-     do from Linux userspace
 
 8. **Alternative approach**: Read EDID directly via i2c-1 bus
    (USB-C display's I2C adapter) instead of through AUX
@@ -684,20 +730,25 @@ The PHY is out of reset and in DP mode, but AUX signals still don't reach the di
    - Would not support DPCD/link training but would get correct EDID
 
 ## Files Modified
-- `drivers/ps5/usbc.c` — USB-C ICC driver (new)
+
+### Kernel (`linux.patch` — 84 files total)
+- `drivers/ps5/usbc.c` — USB-C ICC driver (new): SET_PDCON_OP_MODE, SET_OPT_PDP_ENABLE, GET_DEV_CONN_STATE, NOTIFY_SOC_WORKING, HPD callback, polling, debugfs
 - `drivers/ps5/spcie.c` — USBC notification dispatch
 - `drivers/ps5/Makefile` — Add usbc.o
-- `include/linux/ps5.h` — USBC API declarations
-- `drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c` — Connector injection
-- `drivers/gpu/drm/amd/display/dc/link/link_factory.c` — DP_IS_USB_C, alt mode log
-- `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config
-- `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c` — acquire_phy (combo PHY + AUX engine enable, HPD_SEL fix, IGNORE_HPD_DISCON), enable_dp_output, disable_output, register dumps, CNTL6 fix
+- `include/linux/ps5.h` — USBC API declarations (ps5_usbc_set_opt_pdp_enable, etc.)
+- `drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c` — Connector injection for USB-C
+- `drivers/gpu/drm/amd/display/dc/link/link_factory.c` — DP_IS_USB_C, usbc_combo_phy, alt mode log
+- `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config for USB-C
+- `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c` — acquire_phy (combo PHY HDMI→DP, reset release, AUX engine enable, HPD_SEL fix, IGNORE_HPD_DISCON), enable_dp_output, disable_output, full CNTL0-CNTL14 register dumps for HDMI and USB-C
 - `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h` — DPCS_DCN201_MASK_SH_LIST cleanup
 - `drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c` — DPCS_DCN2_CMN_REG_LIST in link_regs, DPALT shift/mask defines, missing register offset defines, LE_SF entries
 - `drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h` — acquire_phy/release_phy function pointers
-- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log, force=ON for USB-C
 - `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — EDID read debug log (aux_mode, ddc, connector)
-- `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result)
+- `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result, returned_bytes)
+
+### Linux Loader (`ps5-linux-loader`)
+- `shellcode_kernel/boot_linux.c` — Added `mp3_set_hdcp_packet(1, 1)` and `mp3_enable_output(1, 1)` for USB-C (be=1)
 
 ## Debug Interfaces
 - `/sys/kernel/debug/ps5_usbc/conn_state` — Current connection state
@@ -714,8 +765,22 @@ The PHY is out of reset and in DP mode, but AUX signals still don't reach the di
 
 ## Key dmesg Lines to Watch
 ```
+# USBC driver init
+usbc: SET_PDCON_OP_MODE PortId(00) OpMode(5)
+usbc: SET_OPT_PDP_ENABLE PortId(00) Enable(1)       # NEW — check success/failure
+usbc: NOTIFY_SOC_WORKING PortId(00)
+usbc: GET_DEV_CONN_STATE [OK] PortId(03) ... Hpd(0) # PortId=3, Hpd=0
+usbc: DP alt mode active at boot
+
+# HDMI PHY (RDPCSTX0, working reference — NEW dump)
+PS5:  HDMI PHY CNTL0=0x... CNTL2=0x... CNTL3=0x... CNTL4=0x...
+PS5:  HDMI PHY CNTL5=0x... CNTL6=0x... CNTL7=0x... CNTL8=0x...
+PS5:  HDMI PHY CNTL9=0x... CNTL10=0x... CNTL11=0x... CNTL12=0x...
+PS5:  HDMI PHY CNTL13=0x... CNTL14=0x...
+
+# USB-C PHY (RDPCSTX1)
 PS5:  VBIOS i2c_info for USB-C: i2c_line=1 engine=1 hw_assist=1
-PS5:  Combo PHY DP alt mode at init: ENABLED    # or DISABLED
+PS5:  Combo PHY DP alt mode at init: ENABLED
 PS5:  Combo PHY regs: CNTL2=0x... CNTL5=0x... CNTL6=0x... CNTL11=0x...
 PS5:  Combo PHY power: CNTL0=0x...              # check RESET + HDMIMODE bits
 PS5:  PHY in HDMI mode, switching to DP mode    # if HDMIMODE_ENABLE=1
@@ -727,11 +792,28 @@ PS5:  Fixing AUX_HPD_SEL: 1 -> 2 (HPD2 for USB-C)
 PS5:  After AUX fix: AUX_CONTROL=0x01250001 (AUX_EN=1 HPD_SEL=2)
 PS5:  Combo PHY DPALT_DISABLE = 0                # 0=enabled, 1=disabled
 PS5:  Combo PHY acquired for DP alt mode
-PS5:  emulated_link_detect: aux_mode=1 transaction_type=2
-PS5:  emulated_link_detect: acquire_phy=1        # 1=success
-PS5:  dce_aux_transfer_raw: en=1 addr=0x... operation_result=0  # 0=success
-PS5:  emulated_link_detect: EDID status=1        # 1=EDID_OK, 0=no EDID
+
+# USB-C PHY full dump (NEW)
+PS5:  PHY CNTL0=0x... CNTL2=0x... CNTL3=0x... CNTL4=0x...
+PS5:  PHY CNTL5=0x... CNTL6=0x... CNTL7=0x... CNTL8=0x...
+PS5:  PHY CNTL9=0x... CNTL10=0x... CNTL11=0x... CNTL12=0x...
+PS5:  PHY CNTL13=0x... CNTL14=0x...
+
+# AUX transfers
+PS5:  dce_aux_transfer_raw: en=0 ... operation_result=0  # HDMI AUX (works)
+PS5:  dce_aux_transfer_raw: en=1 addr=0x0218 ... operation_result=3  # USB-C TIMEOUT
+PS5:  emulated_link_detect: EDID status=0        # 0=no EDID, 1=success
 ```
+
+## Module Parameters
+The USBC driver supports runtime-configurable parameters:
+```
+usbc_port_id=0       # USB-C port ID (default 0, device reports PortId=3)
+pdcon_op_mode=5      # PDCON op mode (5=USB+DP, 4=USB only)
+opt_pdp_enable=1     # SET_OPT_PDP_ENABLE value (1=enable, 2=alt)
+msg_type_set_opt_pdp_enable=0x12  # ICC msg_type override
+```
+Test with different port ID: `modprobe usbc usbc_port_id=3`
 
 ## AUX Return Codes (enum aux_return_code_type)
 | Value | Name | Meaning |
