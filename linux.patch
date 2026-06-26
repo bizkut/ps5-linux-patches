@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..b8df608a0 100644
+index a3cb05490..d30ae719a 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1963,7 +1963,7 @@ index a3cb05490..b8df608a0 100644
 +						((raw->mfg_id[0] >> 2) & 0x1f) + 'A' - 1,
 +						(((raw->mfg_id[0] & 0x3) << 3) | (raw->mfg_id[1] >> 5)) + 'A' - 1,
 +						(raw->mfg_id[1] & 0x1f) + 'A' - 1,
-+						(raw->prod_id[0] << 8) | raw->prod_id[1]);
++						(raw->product_id[0] << 8) | raw->product_id[1]);
 +				} else
 +					DRM_ERROR("PS5: AUX EDID fallback also failed\n");
 +			}
