@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..26fe598bd 100644
+index a3cb05490..b8df608a0 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..26fe598bd 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,89 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,96 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1953,11 +1953,18 @@ index a3cb05490..26fe598bd 100644
 +					(aconnector->dm_dp_aux.ddc_service->ddc_pin == link->ddc->ddc_pin) ? "YES" : "NO");
 +			}
 +			if (ddc) {
-+				DRM_INFO("PS5: AUX fallback: calling drm_edid_read_ddc\n");
++				DRM_INFO("PS5: AUX fallback: calling drm_edid_read_ddc (ddc=%p, name=%s)\n",
++					ddc, ddc->name);
 +				drm_edid = drm_edid_read_ddc(connector, ddc);
-+				if (drm_edid)
-+					DRM_INFO("PS5: AUX EDID read OK (fallback)\n");
-+				else
++				if (drm_edid) {
++					const struct edid *raw = drm_edid_raw(drm_edid);
++					DRM_INFO("PS5: AUX EDID read OK (fallback, %d bytes, mfg=%c%c%c product=0x%04x)\n",
++						(raw->extensions + 1) * EDID_LENGTH,
++						((raw->mfg_id[0] >> 2) & 0x1f) + 'A' - 1,
++						(((raw->mfg_id[0] & 0x3) << 3) | (raw->mfg_id[1] >> 5)) + 'A' - 1,
++						(raw->mfg_id[1] & 0x1f) + 'A' - 1,
++						(raw->prod_id[0] << 8) | raw->prod_id[1]);
++				} else
 +					DRM_ERROR("PS5: AUX EDID fallback also failed\n");
 +			}
 +		}
@@ -2895,7 +2902,7 @@ index 92510af1b..85c9e5878 100644
  #define FAMILY_VGH 144
  #define DEVICE_ID_VGH_163F 0x163F
 diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
-index 404208bf2..85718d593 100644
+index 404208bf2..9b37cb12b 100644
 --- a/drivers/gpu/drm/drm_edid.c
 +++ b/drivers/gpu/drm/drm_edid.c
 @@ -2242,6 +2242,10 @@ static void connector_bad_edid(struct drm_connector *connector,
@@ -2909,12 +2916,16 @@ index 404208bf2..85718d593 100644
  /* Get override or firmware EDID */
  static const struct drm_edid *drm_edid_override_get(struct drm_connector *connector)
  {
-@@ -2257,6 +2261,11 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
+@@ -2257,6 +2261,15 @@ static const struct drm_edid *drm_edid_override_get(struct drm_connector *connec
  	if (!override)
  		override = drm_edid_load_firmware(connector);
  
 +#ifdef CONFIG_X86_PS5
-+	if (IS_ERR(override) && real_edid)
++	/* Only use real_edid (from HDMI ICC read) for HDMI connector,
++	 * not for USB-C (DP-2) which has its own EDID source.
++	 */
++	if (IS_ERR(override) && real_edid &&
++	    connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort)
 +		override = drm_edid_dup(real_edid);
 +#endif
 +
