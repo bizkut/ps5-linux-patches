@@ -863,7 +863,77 @@ in `link_encoder.h` so they can be called from `amdgpu_dm.c`.
 fix. The AUX approach is confirmed dead-end — PS5 firmware uses ICC for ALL
 display communication. ICC EDID read code has been added to usbc.c and wired
 into amdgpu_dm_helpers.c. The setup command (0x6c bytes) was added based on
-firmware disassembly review. Needs boot test with actual USB-C DP display.
+firmware disassembly review. Two new ICC commands (Start EMC service and
+HotPlug Status query) added to investigate HPD assertion. Needs boot test
+with actual USB-C DP display.
+
+### Start EMC HDMI Service & HotPlug Status — IMPLEMENTED, NEEDS TESTING
+
+**Root cause investigation: HPD not asserted**
+
+The `GET_DEV_CONN_STATE` consistently reports `Hpd(0)` even though the
+display is connected with `DpAlt=1`, `Mux=2`, `PinAssign=1`. In USB-C DP
+alt mode, HPD is communicated via USB PD messages (DP_HPD VDM), not a
+physical pin. The display sends a DP_HPD message to the PD controller.
+
+Two new ICC commands were added to investigate and potentially fix this:
+
+**1. Start EMC HDMI service** (firmware offset `0x0090ec50`):
+- `ps5_usbc_start_emc_service(bool is_usbc)` in `drivers/ps5/usbc.c`
+- `service_id=0x70` (EMC service, NOT HDMI display service 0x10)
+- `msg_type=0x0086`
+- `data[0]=0` for USB-C, `data[0]=1` for HDMI
+- `length=0x20` (ICC_MSG_MIN_SIZE)
+- This may initialize the EMC display service and enable HPD/I2C
+  routing to the south bridge for USB-C displays
+- Called before the ICC EDID read in `ps5_usbc_read_edid()`
+- DebugFS: `/sys/kernel/debug/ps5_usbc/emc_service` (write `0`=USB-C, `1`=HDMI)
+
+**2. HotPlug Status query** (firmware offset `0x0090f600`):
+- `ps5_usbc_query_hotplug_status()` in `drivers/ps5/usbc.c`
+- `service_id=0x10` (HDMI ICC service)
+- `data[0]=4` (read command), `data[9]=0x10`, `data[10]=0x40`
+- Reply `data[4]` bit 0 = HPD connected, bit 1 = HPD transition
+- This tells us what the **south bridge** thinks about HPD, which may
+  differ from the PD controller's `Hpd(0)` in `GET_DEV_CONN_STATE`
+- Called before the ICC EDID read in `ps5_usbc_read_edid()`
+- DebugFS: `/sys/kernel/debug/ps5_usbc/hotplug_status` (write anything)
+
+**Firmware disassembly details:**
+
+The "Start EMC HDMI service" function at `0x0090ec50`:
+- Uses `service_id=0x70` (not 0x10) — a separate EMC service
+- Sets `data[0]` based on `edi` parameter: `setnz` → 1 for HDMI, 0 for USB-C
+- Calls `icc_query` at `0x9dce00`
+- Checks reply: `data[0]==0x70`, `data[1:2]==0x4086`, `data[4:5]==0,0` = OK
+- Error string: `[HDMI ERROR] : %s:%i - Start EMC HDMI service : ICC Resut[0x%x 0x%x]`
+
+The "HotPlug Status" function at `0x0090f600`:
+- Uses `service_id=0x10` (HDMI ICC service)
+- Sends query with `data[0]=4`, `data[9]=0x10`, `data[10]=0x40`
+- Reads HPD from reply `data[4]`:
+  - `bl = data[4] & 1` → HPD connected (bit 0)
+  - `test al, 0x2` → HPD transition (bit 1)
+  - If bit 1 set: sets `byte [rel 0x4001d84], 0` (clears some flag)
+  - If bit 1 clear: sets `byte [rel 0x4001d84], 1` (sets some flag)
+- Error string: `[HDMI ERROR] : %s:%i - HotPlug Status : ICC Query Failed (status=%d)`
+
+**Testing procedure:**
+1. Rebuild kernel with updated `linux.patch`
+2. Boot with USB-C DP alt mode display connected
+3. Check dmesg for:
+   - `Sending Start EMC service (service_id=0x70, data[0]=0)`
+   - `EMC service reply: service_id=... msg_type=... length=...`
+   - `EMC service status: data[0]=... data[1]=...`
+   - `Querying HotPlug status via ICC`
+   - `HotPlug status: data[4]=0x... HPD=... (bit0=... bit1=...)`
+4. If EMC service returns OK and HotPlug shows HPD=1, the ICC EDID
+   read should now work (notification should arrive)
+5. If HotPlug still shows HPD=0, the display may not be sending DP_HPD
+   VDM, or the PD controller isn't forwarding it to the south bridge
+6. Try writing to debugfs to test independently:
+   - `echo 0 > /sys/kernel/debug/ps5_usbc/emc_service`
+   - `echo 1 > /sys/kernel/debug/ps5_usbc/hotplug_status`
 
 ### ICC-based EDID Read — IMPLEMENTED, NEEDS TESTING
 
@@ -968,11 +1038,11 @@ Recommendation: keep for now until full pipeline works, then test removing.
 
 ## Files Modified
 
-### Kernel (`linux.patch` — 84 files total)
-- `drivers/ps5/usbc.c` — USB-C ICC driver (new): SET_PDCON_OP_MODE, SET_OPT_PDP_ENABLE, GET_DEV_CONN_STATE, NOTIFY_SOC_WORKING, HPD callback, polling, debugfs, ICC EDID read (setup + read commands + notification handler), `#include <drm/drm_edid.h>` for EDID_LENGTH
+### Kernel (`linux.patch` — 71 files total)
+- `drivers/ps5/usbc.c` — USB-C ICC driver (new): SET_PDCON_OP_MODE, SET_OPT_PDP_ENABLE, GET_DEV_CONN_STATE, NOTIFY_SOC_WORKING, HPD callback, polling, debugfs, ICC EDID read (setup + read commands + notification handler), Start EMC service (service_id=0x70), HotPlug Status query (service_id=0x10), `#include <drm/drm_edid.h>` for EDID_LENGTH
 - `drivers/ps5/spcie.c` — USBC notification dispatch
 - `drivers/ps5/Makefile` — Add usbc.o
-- `include/linux/ps5.h` — USBC API declarations (ps5_usbc_set_opt_pdp_enable, ps5_usbc_read_edid, etc.)
+- `include/linux/ps5.h` — USBC API declarations (ps5_usbc_set_opt_pdp_enable, ps5_usbc_read_edid, ps5_usbc_start_emc_service, ps5_usbc_query_hotplug_status, etc.)
 - `drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c` — Connector injection for USB-C, svm_transmitter_control_v1_6
 - `drivers/gpu/drm/amd/display/dc/link/link_factory.c` — DP_IS_USB_C, usbc_combo_phy, alt mode log
 - `drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c` — DDC2 pin config for USB-C
@@ -995,6 +1065,9 @@ Recommendation: keep for now until full pipeline works, then test removing.
 - `/sys/kernel/debug/ps5_usbc/last_notif` — Last ICC notification
 - `/sys/kernel/debug/ps5_usbc/probe` — Probe ICC message types
 - `/sys/kernel/debug/ps5_usbc/trigger_hpd` — Manually trigger HPD event
+- `/sys/kernel/debug/ps5_usbc/read_edid` — Trigger ICC EDID read
+- `/sys/kernel/debug/ps5_usbc/emc_service` — Start EMC service (write `0`=USB-C, `1`=HDMI)
+- `/sys/kernel/debug/ps5_usbc/hotplug_status` — Query HotPlug status via ICC
 - `/sys/class/drm/card0-DP-2/status` — Connector status
 - `/sys/class/drm/card0-DP-2/edid` — EDID binary
 - `/sys/class/drm/card0-DP-2/modes` — Available modes
@@ -1013,6 +1086,11 @@ usbc: GET_DEV_CONN_STATE [OK] PortId(03) ... Hpd(0) # PortId=3, Hpd=0
 usbc: DP alt mode active at boot
 
 # ICC EDID read (NEW — key test output)
+usbc: Sending Start EMC service (service_id=0x70, data[0]=0)  # EMC init
+usbc: EMC service reply: service_id=... msg_type=... length=...
+usbc: EMC service status: data[0]=... data[1]=...
+usbc: Querying HotPlug status via ICC               # HPD check
+usbc: HotPlug status: data[4]=0x... HPD=... (bit0=... bit1=...)
 usbc: Sending ICC HDMI setup command (0x6c bytes)
 usbc: Setup reply: service_id=0x10 msg_type=0x4000 length=...
 usbc: Setup status: data[0]=0 data[1]=0           # 0=OK

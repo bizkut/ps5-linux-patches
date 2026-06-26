@@ -17,19 +17,23 @@ The patch is applied on top of stock Linux kernel (v7.1.y) via `git apply`.
 - New files use `--- /dev/null` format
 
 ## Key Files
-- `linux.patch` — the complete kernel patch (84 files)
+- `linux.patch` — the complete kernel patch (71 files)
 - `.config` — kernel config for PS5
 - `USB-C-DP-ALT-MODE.md` — USB-C DP alt mode development notes
 
 ## USB-C DP Alt Mode Status
 - AUX transfers for HDMI (DP-1, RDPCSTX0) work fine
 - AUX transfers for USB-C (DP-2, RDPCSTX1) still timeout (operation_result=3)
+- AUX approach is a confirmed dead end — PS5 firmware uses ICC for ALL display communication
 - PHY CNTL0 switches from HDMI mode to DP mode and releases reset OK
 - AUX_CONTROL is fixed (AUX_EN=1, HPD_SEL=2, IGNORE_HPD_DISCON=1)
 - DPALT_DISABLE=0 (alt mode enabled)
-- Missing: `SET_OPT_PDP_ENABLE` ICC command (msg_type 0x12) — now added
-- Missing: correct port_id — device reports PortId=3, commands send to PortId=0
+- ICC EDID read implemented (setup + read commands + notification handler)
+- ICC EDID read fails: HPD=0 prevents south bridge from reading EDID
+- Start EMC service (service_id=0x70) added — may initialize display path for USB-C
+- HotPlug Status query (service_id=0x10, data[9]=0x10) added — checks south bridge HPD
 - HPD=0 in GET_DEV_CONN_STATE — display connected but HPD not asserted
+- Root cause: USB-C HPD is virtual (via USB PD DP_HPD VDM), not a physical pin
 
 ## Modifying linux.patch
 When making changes to the kernel source in `/Volumes/FreeBSD/linux`:
