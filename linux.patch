@@ -1578,6 +1578,509 @@ index 52f4e9e09..6e4ff7444 100644
  	r = sdma_v5_0_init_microcode(adev);
  	if (r)
  		return r;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f8c13bad4..378b6ede7 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -80,6 +80,10 @@
+ #include <linux/component.h>
+ #include <linux/sort.h>
+ 
++#ifdef CONFIG_X86_PS5
++#include <linux/ps5.h>
++#endif
++
+ #include <drm/drm_privacy_screen_consumer.h>
+ #include <drm/display/drm_dp_mst_helper.h>
+ #include <drm/display/drm_hdmi_helper.h>
+@@ -3093,7 +3097,10 @@ static int dm_hw_init(struct amdgpu_ip_block *ip_block)
+ 	r = amdgpu_dm_init(adev);
+ 	if (r)
+ 		return r;
++#ifndef CONFIG_X86_PS5
++	/* HPD is not supported. */
+ 	amdgpu_dm_hpd_init(adev);
++#endif
+ 
+ 	r = dm_oem_i2c_hw_init(adev);
+ 	if (r)
+@@ -3114,7 +3121,10 @@ static int dm_hw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
++#ifndef CONFIG_X86_PS5
++	/* HPD is not supported. */
+ 	amdgpu_dm_hpd_fini(adev);
++#endif
+ 
+ 	amdgpu_dm_irq_fini(adev);
+ 	amdgpu_dm_fini(adev);
+@@ -3370,6 +3380,9 @@ static void emulated_link_detect(struct dc_link *link)
+ 	struct dc_sink *sink = NULL;
+ 	struct dc_sink *prev_sink = NULL;
+ 
++	drm_info(dev, "[PS5] emulated_link_detect: connector_signal=%d link_type=%d\n",
++		 link->connector_signal, link->type);
++
+ 	link->type = dc_connection_none;
+ 	prev_sink = link->local_sink;
+ 
+@@ -3421,6 +3434,24 @@ static void emulated_link_detect(struct dc_link *link)
+ 		return;
+ 	}
+ 
++	/* Update DDC transaction type and aux_mode so EDID read
++	 * uses the correct AUX engine (DDC2 for USB-C).
++	 */
++	set_ddc_transaction_type(link->ddc, sink_caps.transaction_type);
++	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
++	drm_info(dev, "[PS5] emulated_link_detect: aux_mode=%d transaction_type=%d\n",
++		link->aux_mode, sink_caps.transaction_type);
++
++	/* PS5: Acquire combo PHY before EDID read for USB-C DP.
++	 * The combo PHY needs to be in DP alt mode with ref clock enabled
++	 * for AUX transactions to work. Normally this happens during
++	 * enable_dp_output, but emulated detect reads EDID before that.
++	 */
++	if (link->link_enc && link->link_enc->funcs->acquire_phy) {
++		bool acquired = link->link_enc->funcs->acquire_phy(link->link_enc);
++		drm_info(dev, "[PS5] emulated_link_detect: acquire_phy=%d\n", acquired);
++	}
++
+ 	sink_init_data.link = link;
+ 	sink_init_data.sink_signal = sink_caps.signal;
+ 
+@@ -3438,6 +3469,8 @@ static void emulated_link_detect(struct dc_link *link)
+ 			link,
+ 			sink);
+ 
++	drm_info(dev, "[PS5] emulated_link_detect: EDID status=%d\n", edid_status);
++
+ 	if (edid_status != EDID_OK)
+ 		drm_err(dev, "Failed to read EDID\n");
+ 
+@@ -4222,8 +4255,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+ 	bool ret = false;
+ 	bool debounce_required = false;
+ 
+-	if (adev->dm.disable_hpd_irq)
++	if (adev->dm.disable_hpd_irq) {
++		drm_info(dev, "[PS5] handle_hpd_irq_helper: disable_hpd_irq set, returning\n");
+ 		return;
++	}
++
++	drm_info(dev, "[PS5] handle_hpd_irq_helper: connector=%s force=%d\n",
++		 connector->name, connector->force);
+ 
+ 	/*
+ 	 * In case of failure or MST no need to update connector status or notify the OS
+@@ -4243,6 +4281,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+ 	if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
+ 		drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
+ 
++	drm_info(adev_to_drm(adev), "[PS5] connection_type=%d force=%d\n",
++		 new_connection_type, aconnector->base.force);
++
+ 	/*
+ 	 * Check for HDMI disconnect with debounce enabled.
+ 	 */
+@@ -4315,6 +4356,81 @@ static void handle_hpd_irq(void *param)
+ 
+ }
+ 
++#ifdef CONFIG_X86_PS5
++/* PS5: USBC DP alt mode HPD callback.
++ * Called by the PS5 USBC driver when a USB-C DP connection state changes.
++ * We find the USB-C connector and forward the HPD event to the standard
++ * amdgpu DM HPD handler.
++ */
++static struct amdgpu_device *ps5_usbc_hpd_adev;
++static struct amdgpu_dm_connector *ps5_usbc_find_aconnector(struct amdgpu_device *adev)
++{
++	struct drm_device *dev = adev_to_drm(adev);
++	struct drm_connector *connector;
++	struct amdgpu_dm_connector *aconnector;
++
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++		aconnector = to_amdgpu_dm_connector(connector);
++		if (aconnector->dc_link) {
++			drm_info(dev, "[PS5] connector %s: link_id.id=%d enum_id=%d\n",
++				 connector->name,
++				 aconnector->dc_link->link_id.id,
++				 aconnector->dc_link->link_id.enum_id);
++			/* PS5 VBIOS reports both HDMI and USB-C as
++			 * CONNECTOR_ID_DISPLAY_PORT. The USB-C connector
++			 * is enum_id=2 (HDMI is enum_id=1). */
++			if (aconnector->dc_link->link_id.enum_id == ENUM_ID_2 &&
++			    aconnector->dc_link->link_id.id == CONNECTOR_ID_DISPLAY_PORT)
++				return aconnector;
++		}
++	}
++	return NULL;
++}
++
++static void ps5_usbc_hpd_callback(enum ps5_usbc_hpd_event event, void *data)
++{
++	struct amdgpu_device *adev = ps5_usbc_hpd_adev;
++	struct amdgpu_dm_connector *aconnector;
++
++	if (!adev)
++		return;
++
++	aconnector = ps5_usbc_find_aconnector(adev);
++	if (!aconnector) {
++		drm_warn(adev_to_drm(adev), "[PS5] USBC HPD: no USB-C connector found\n");
++		return;
++	}
++
++	drm_info(adev_to_drm(adev), "[PS5] USBC HPD event %d for connector %s\n",
++		 event, aconnector->base.name);
++
++	/* For USB-C DP alt mode, the normal dc_link_detect may fail to
++	 * detect the display via AUX if the PD controller hasn't fully
++	 * configured the DP path. Use force=ON to trigger the emulated
++	 * link detect path which creates a virtual sink and reads EDID.
++	 */
++	if (event == PS5_USBC_HPD_CONNECT) {
++		aconnector->base.force = DRM_FORCE_ON;
++		drm_info(adev_to_drm(adev), "[PS5] USBC: forcing connector ON for emulated detect\n");
++	} else if (event == PS5_USBC_HPD_DISCONNECT) {
++		aconnector->base.force = DRM_FORCE_UNSPECIFIED;
++		drm_info(adev_to_drm(adev), "[PS5] USBC: clearing force for disconnect\n");
++	}
++
++	switch (event) {
++	case PS5_USBC_HPD_CONNECT:
++	case PS5_USBC_HPD_IRQ:
++		handle_hpd_irq_helper(aconnector);
++		break;
++	case PS5_USBC_HPD_DISCONNECT:
++		handle_hpd_irq_helper(aconnector);
++		break;
++	default:
++		break;
++	}
++}
++#endif
++
+ static void schedule_hpd_rx_offload_work(struct amdgpu_device *adev, struct hpd_rx_irq_offload_work_queue *offload_wq,
+ 							union hpd_irq_data hpd_irq_data)
+ {
+@@ -4479,6 +4595,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
+ 	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
+ 	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
+ 
++#ifdef CONFIG_X86_PS5
++	/* PS5: Register USBC HPD callback for USB-C DP alt mode hotplug */
++	ps5_usbc_hpd_adev = adev;
++	ps5_usbc_register_hpd_callback(ps5_usbc_hpd_callback, NULL);
++	drm_info(adev_to_drm(adev), "[PS5] Registered USBC HPD callback\n");
++#endif
++
+ 	if (dc_is_dmub_outbox_supported(adev->dm.dc)) {
+ 		if (!register_dmub_notify_callback(adev, DMUB_NOTIFICATION_HPD,
+ 			dmub_hpd_callback, true)) {
+@@ -6880,6 +7003,12 @@ static void fill_stream_properties_from_drm_display_mode(
+ 
+ 	stream->output_color_space = get_output_color_space(timing_out, connector_state);
+ 	stream->content_type = get_output_content_type(connector_state);
++
++#ifdef CONFIG_X86_PS5
++	/* Hardcode RGB888. */
++	// timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
++	// timing_out->display_color_depth = COLOR_DEPTH_888;
++#endif
+ }
+ 
+ static void fill_audio_info(struct audio_info *audio_info,
+@@ -8269,6 +8398,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+ 	 */
+ 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+ 
++#ifdef CONFIG_X86_PS5
++	if (!isHdmiModeValid(mode, amdgpu_force_1080p))
++		return MODE_ERROR;
++#endif
++
+ 	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
+ 			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
+ 		return result;
+@@ -10957,12 +11091,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
+ 	drm_dp_mst_atomic_wait_for_dependencies(state);
+ 
++#ifdef CONFIG_X86_PS5
++	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
++				      new_crtc_state, i) {
++		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
++		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
++
++		if ((new_crtc_state->active &&
++		    (!old_crtc_state->active ||
++		     drm_atomic_crtc_needs_modeset(new_crtc_state))) ||
++		    (old_crtc_state->active &&
++		    (!new_crtc_state->active ||
++		     drm_atomic_crtc_needs_modeset(new_crtc_state)))) {
++			if (dm_new_crtc_state->stream && dc_is_dp_signal(dm_new_crtc_state->stream->signal)) {
++				/* Call HDMI-specific functions for the HDMI
++				 * connector (which uses DP signal internally
++				 * via the FLAVA3 HDMI IC), but not for USB-C DP.
++				 * PS5 VBIOS reports both as CONNECTOR_ID_DISPLAY_PORT;
++				 * USB-C is enum_id=2.
++				 */
++				if (dm_new_crtc_state->stream->link->link_id.enum_id != ENUM_ID_2) {
++					sceHdmiSetAudioMute(1);
++					sceHdmiDeviceSetVideoMute(1);
++					sceHdmiInitVideoConfig();
++				}
++			}
++		}
++	}
++#endif
++
+ 	dm_state = dm_atomic_get_new_state(state);
+ 	if (dm_state && dm_state->context) {
+ 		dc_state = dm_state->context;
+ 		amdgpu_dm_commit_streams(state, dc_state);
+ 	}
+ 
++#ifdef CONFIG_X86_PS5
++	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
++				      new_crtc_state, i) {
++		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
++		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
++
++		if (new_crtc_state->active &&
++		    (!old_crtc_state->active ||
++		     drm_atomic_crtc_needs_modeset(new_crtc_state))) {
++			if (dm_new_crtc_state->stream && dc_is_dp_signal(dm_new_crtc_state->stream->signal)) {
++				struct dc_stream_state *stream = dm_new_crtc_state->stream;
++				int channels = 0, j;
++
++				/* Call HDMI-specific functions for the HDMI
++				 * connector (which uses DP signal internally
++				 * via the FLAVA3 HDMI IC). USB-C DP uses the
++				 * standard DC pipeline for video/audio.
++				 * PS5 VBIOS reports both as CONNECTOR_ID_DISPLAY_PORT;
++				 * USB-C is enum_id=2.
++				 */
++				if (stream->link->link_id.enum_id == ENUM_ID_2)
++					continue;
++
++				for (j = 0; j < stream->audio_info.mode_count; j++) {
++					if (stream->audio_info.modes[j].channel_count > channels)
++						channels = stream->audio_info.modes[j].channel_count;
++				}
++
++				/* Fallback to stereo if EDID has no audio modes */
++				if (channels == 0)
++					channels = 2;
++
++				sceHdmiSetVideoConfig(&new_crtc_state->mode);
++				sceHdmiDeviceSetVideoMute(0);
++				sceHdmiSetAudioConfig(channels);
++				sceHdmiSetAudioMute(0);
++			}
++		}
++	}
++#endif
++
+ 	amdgpu_dm_update_hdcp(state);
+ 
+ 	/* Handle connector state changes */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index a3cb05490..b655055c2 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -29,6 +29,7 @@
+ #include <linux/string.h>
+ #include <linux/acpi.h>
+ #include <linux/i2c.h>
++#include <linux/ps5.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_probe_helper.h>
+@@ -1100,6 +1101,52 @@ enum dc_edid_status dm_helpers_read_local_edid(
+ 	if (link->dc->hwss.prepare_ddc)
+ 		link->dc->hwss.prepare_ddc(link);
+ 
++	/* PS5 USB-C DP alt mode: use ICC-based EDID read instead of AUX.
++	 * The PS5 firmware uses ICC (service_id=0x10) for all display
++	 * communication. The GPU's AUX engine is NOT used for USB-C.
++	 * AUX transactions always time out for USB-C (DP-2).
++	 */
++	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
++	    link->link_enc->funcs->is_in_alt_mode &&
++	    link->link_enc->funcs->is_in_alt_mode(link->link_enc)) {
++		u8 icc_edid[512];
++		int icc_ret;
++
++		DRM_INFO("PS5: USB-C DP alt mode — reading EDID via ICC\n");
++		icc_ret = ps5_usbc_read_edid(icc_edid, sizeof(icc_edid));
++		if (icc_ret > 0) {
++			drm_edid = drm_edid_alloc(icc_edid, icc_ret);
++			DRM_INFO("PS5: ICC EDID read OK (%d bytes)\n", icc_ret);
++		} else {
++			DRM_ERROR("PS5: ICC EDID read failed: %d\n", icc_ret);
++			drm_edid = NULL;
++		}
++		drm_edid_connector_update(connector, drm_edid);
++
++		if (!drm_edid)
++			return EDID_NO_EDID;
++
++		edid = drm_edid_raw(drm_edid);
++		if (!edid ||
++		    edid->extensions >= sizeof(sink->dc_edid.raw_edid) / EDID_LENGTH)
++			return EDID_BAD_INPUT;
++
++		sink->dc_edid.length = EDID_LENGTH * (edid->extensions + 1);
++		memmove(sink->dc_edid.raw_edid, (uint8_t *)edid, sink->dc_edid.length);
++
++		drm_edid_free(drm_edid);
++
++		edid_status = dm_helpers_parse_edid_caps(
++					link,
++					&sink->dc_edid,
++					&sink->edid_caps);
++
++		if (edid_status != EDID_OK)
++			DRM_ERROR("EDID err: %d, on connector: %s",
++				  edid_status, aconnector->base.name);
++		return edid_status;
++	}
++
+ 	/* some dongles read edid incorrectly the first time,
+ 	 * do check sum and retry to make sure read correct edid.
+ 	 */
+diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+index 0e1f97332..a75f4b9e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
++++ b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+@@ -44,6 +44,18 @@
+ 
+ #include "bios_parser_common.h"
+ 
++#ifdef CONFIG_X86_PS5
++#include <linux/printk.h>
++#include <linux/ps5.h>
++/* PS5: The VBIOS may only define the HDMI connector (UNIPHY_A).
++ * We inject a second connector (USB-C DP alt mode, UNIPHY_B) so
++ * the DC core creates a link for the USB-C DP port.
++ */
++static bool ps5_usbc_connector_injected;
++static struct graphics_object_id ps5_usbc_connector_id;
++static struct graphics_object_id ps5_usbc_encoder_id;
++#endif
++
+ #define DC_LOGGER \
+ 	bp->base.ctx->logger
+ 
+@@ -157,6 +169,16 @@ static uint8_t bios_parser_get_connectors_number(struct dc_bios *dcb)
+ 
+ 		break;
+ 	}
++
++#ifdef CONFIG_X86_PS5
++	/* PS5: Ensure at least 2 connectors (HDMI + USB-C DP).
++	 * If the VBIOS only defines 1 (HDMI), we inject a USB-C connector.
++	 */
++	if (count < 2) {
++		pr_info("[PS5] VBIOS has %u connector(s), injecting USB-C DP connector\n", count);
++		count = 2;
++	}
++#endif
+ 	return count;
+ }
+ 
+@@ -198,6 +220,22 @@ static struct graphics_object_id bios_parser_get_connector_id(
+ 		}
+ 		break;
+ 	}
++
++#ifdef CONFIG_X86_PS5
++	/* PS5: If the VBIOS doesn't define a connector for this index,
++	 * inject a USB-C DP connector (CONNECTOR_ID_USBC, ENUM_ID_1)
++	 * mapped to UNIPHY_B (ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2).
++	 */
++	if (object_id.id == 0 || object_id.type == OBJECT_TYPE_UNKNOWN) {
++		object_id = dal_graphics_object_id_init(
++			CONNECTOR_ID_USBC, ENUM_ID_1, OBJECT_TYPE_CONNECTOR);
++		ps5_usbc_connector_id = object_id;
++		ps5_usbc_encoder_id = dal_graphics_object_id_init(
++			ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2, OBJECT_TYPE_ENCODER);
++		ps5_usbc_connector_injected = true;
++		pr_info("[PS5] Injected USB-C DP connector for index %u\n", i);
++	}
++#endif
+ 	return object_id;
+ }
+ 
+@@ -260,6 +298,19 @@ static enum bp_result bios_parser_get_src_obj(struct dc_bios *dcb,
+ 		}
+ 		break;
+ 	case OBJECT_TYPE_CONNECTOR:
++#ifdef CONFIG_X86_PS5
++		/* PS5: For the injected USB-C connector, return the hardcoded
++		 * UNIPHY_B encoder (ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2).
++		 */
++		if (ps5_usbc_connector_injected &&
++		    object_id.type == ps5_usbc_connector_id.type &&
++		    object_id.id == ps5_usbc_connector_id.id &&
++		    object_id.enum_id == ps5_usbc_connector_id.enum_id) {
++			*src_object_id = ps5_usbc_encoder_id;
++			pr_info("[PS5] Returning injected UNIPHY_B encoder for USB-C connector\n");
++			return BP_RESULT_OK;
++		}
++#endif
+ 		switch (bp->object_info_tbl.revision.minor) {
+ 		default:
+ 		case 4:
+@@ -578,6 +629,23 @@ static enum bp_result bios_parser_get_hpd_info(
+ 	if (!info)
+ 		return BP_RESULT_BADINPUT;
+ 
++#ifdef CONFIG_X86_PS5
++	/* PS5: For the injected USB-C connector, return HPD2 info.
++	 * UNIPHY_A (HDMI) uses HPD1, UNIPHY_B (USB-C DP) uses HPD2.
++	 * Note: HPD for USB-C is actually handled via ICC notifications,
++	 * not GPIO interrupts. This just prevents the ASSERT in construct_phy.
++	 */
++	if (ps5_usbc_connector_injected &&
++	    id.type == ps5_usbc_connector_id.type &&
++	    id.id == ps5_usbc_connector_id.id &&
++	    id.enum_id == ps5_usbc_connector_id.enum_id) {
++		info->hpd_int_gpio_uid = 2; /* HPD2 */
++		info->hpd_active = 0;
++		pr_info("[PS5] Returning HPD2 info for USB-C connector\n");
++		return BP_RESULT_OK;
++	}
++#endif
++
+ 	switch (bp->object_info_tbl.revision.minor) {
+ 	case 4:
+ 	default:
+@@ -790,6 +858,20 @@ static enum bp_result bios_parser_get_device_tag(
+ 	if (!info)
+ 		return BP_RESULT_BADINPUT;
+ 
++#ifdef CONFIG_X86_PS5
++	/* PS5: For the injected USB-C connector, return a DP device tag. */
++	if (ps5_usbc_connector_injected &&
++	    connector_object_id.type == ps5_usbc_connector_id.type &&
++	    connector_object_id.id == ps5_usbc_connector_id.id &&
++	    connector_object_id.enum_id == ps5_usbc_connector_id.enum_id) {
++		info->acpi_device = 0;
++		info->dev_id.device_type = DEVICE_TYPE_DFP;
++		info->dev_id.enum_id = 2;
++		pr_info("[PS5] Returning DP device tag for USB-C connector\n");
++		return BP_RESULT_OK;
++	}
++#endif
++
+ 	switch (bp->object_info_tbl.revision.minor) {
+ 	case 4:
+ 	default:
 diff --git a/drivers/gpu/drm/amd/display/dc/bios/command_table2.c b/drivers/gpu/drm/amd/display/dc/bios/command_table2.c
 index 17ef515c6..8b9c1f650 100644
 --- a/drivers/gpu/drm/amd/display/dc/bios/command_table2.c
@@ -1648,6 +2151,483 @@ index 05991a10f..777593ddd 100644
  		    asic_id.chip_id == DEVICE_ID_NV_13DB) {
  			dc_version = DCN_VERSION_2_01;
  			break;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+index 673bb87d2..c7144160d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+@@ -575,8 +575,16 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+ 	}
+ 
+ 	aux_engine = ddc->ctx->dc->res_pool->engines[ddc_pin->pin_data->en];
++#ifdef CONFIG_X86_PS5
++	pr_info("PS5: dce_aux_transfer_raw: en=%d addr=0x%04x len=%u write=%d aux_engine=%p",
++		ddc_pin->pin_data->en, payload->address, payload->length,
++		payload->write, aux_engine);
++#endif
+ 	if (!acquire(aux_engine, ddc_pin)) {
+ 		*operation_result = AUX_RET_ERROR_ENGINE_ACQUIRE;
++#ifdef CONFIG_X86_PS5
++		pr_info("PS5: dce_aux_transfer_raw: FAILED to acquire aux engine");
++#endif
+ 		return -1;
+ 	}
+ 
+@@ -595,6 +603,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+ 	submit_channel_request(aux_engine, &aux_req);
+ 	*operation_result = get_channel_status(aux_engine, &returned_bytes);
+ 
++#ifdef CONFIG_X86_PS5
++	pr_info("PS5: dce_aux_transfer_raw: operation_result=%d returned_bytes=%u",
++		*operation_result, returned_bytes);
++#endif
++
+ 	if (*operation_result == AUX_RET_SUCCESS) {
+ 		int __maybe_unused bytes_replied = 0;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
+index 9459e8f28..19aaf042a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
+@@ -33,6 +33,11 @@
+ 
+ #include "gpio_service_interface.h"
+ 
++#ifdef CONFIG_X86_PS5
++#include <linux/delay.h>
++#include <linux/printk.h>
++#endif
++
+ #define CTX \
+ 	enc10->base.ctx
+ 
+@@ -56,7 +61,7 @@ static void dcn201_link_encoder_get_max_link_cap(struct link_encoder *enc,
+ 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
+ 
+ 	dcn10_link_encoder_get_max_link_cap(enc, link_settings);
+-	REG_GET_2(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value1,
++	REG_GET_2(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value1,
+ 		 RDPCS_PHY_DPALT_DP4, &value2);
+ 	/*limit to combo_phy*/
+ 	if (enc->usbc_combo_phy) {
+@@ -70,12 +75,248 @@ static bool dcn201_link_encoder_is_in_alt_mode(struct link_encoder *enc)
+ 	uint32_t value;
+ 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
+ 
+-	REG_GET(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value);
++	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
+ 
+ 	// if value == 1 alt mode is disabled, otherwise it is enabled
+ 	return !value;
+ }
+ 
++#ifdef CONFIG_X86_PS5
++/* PS5: Acquire combo PHY for USB-C DP alt mode.
++ * On PS5, the USB-C port is PSVR2-only and the firmware may not
++ * configure the combo PHY for DP alt mode. This function:
++ * 1. Checks if DP alt mode is enabled (RDPCS_PHY_DPALT_DISABLE == 0)
++ * 2. If not, tries to enable it by clearing DPALT_DISABLE
++ * 3. Acknowledges alt mode (DPALT_DISABLE_ACK = 0)
++ * 4. Enables DP reference clock (DP_REF_CLK_EN = 1)
++ * Based on dcn21_link_encoder_acquire_phy. DPALT bits and REF_CLK_EN
++ * are all in PHY_CNTL6 on DCN201 (same as DCN20/DCN21).
++ */
++static bool dcn201_link_encoder_acquire_phy(struct link_encoder *enc)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++	uint32_t value, cntl2, cntl5, cntl6, cntl11;
++
++	if (!enc->features.flags.bits.DP_IS_USB_C) {
++		/* Non-USB-C (HDMI): dump registers for comparison, then enable ref clock */
++		uint32_t h0, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14;
++		h0 = REG_READ(RDPCSTX_PHY_CNTL0);
++		h2 = REG_READ(RDPCSTX_PHY_CNTL2);
++		h3 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL3);
++		h4 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL4);
++		h5 = REG_READ(RDPCSTX_PHY_CNTL5);
++		h6 = REG_READ(RDPCSTX_PHY_CNTL6);
++		h7 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL7);
++		h8 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL8);
++		h9 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL9);
++		h10 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL10);
++		h11 = REG_READ(RDPCSTX_PHY_CNTL11);
++		h12 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL12);
++		h13 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL13);
++		h14 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL14);
++		pr_info("PS5:  HDMI PHY CNTL0=0x%08x CNTL2=0x%08x CNTL3=0x%08x CNTL4=0x%08x",
++			h0, h2, h3, h4);
++		pr_info("PS5:  HDMI PHY CNTL5=0x%08x CNTL6=0x%08x CNTL7=0x%08x CNTL8=0x%08x",
++			h5, h6, h7, h8);
++		pr_info("PS5:  HDMI PHY CNTL9=0x%08x CNTL10=0x%08x CNTL11=0x%08x CNTL12=0x%08x",
++			h9, h10, h11, h12);
++		pr_info("PS5:  HDMI PHY CNTL13=0x%08x CNTL14=0x%08x",
++			h13, h14);
++		REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
++		return true;
++	}
++
++	/* USB-C combo PHY: dump register state for debugging */
++	cntl2 = REG_READ(RDPCSTX_PHY_CNTL2);
++	cntl5 = REG_READ(RDPCSTX_PHY_CNTL5);
++	cntl6 = REG_READ(RDPCSTX_PHY_CNTL6);
++	cntl11 = REG_READ(RDPCSTX_PHY_CNTL11);
++	pr_info("PS5:  Combo PHY regs: CNTL2=0x%08x CNTL5=0x%08x CNTL6=0x%08x CNTL11=0x%08x",
++		cntl2, cntl5, cntl6, cntl11);
++	{
++		uint32_t cntl0;
++		cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++		pr_info("PS5:  Combo PHY power: CNTL0=0x%08x", cntl0);
++
++		/* PS5 firmware leaves USB-C combo PHY in reset + HDMI mode.
++		 * Switch to DP mode and take PHY out of reset so AUX signals
++		 * can pass through to the USB-C display.
++		 *
++		 * RDPCS_PHY_HDMIMODE_ENABLE (bit 8): 1=HDMI, 0=DP
++		 * RDPCS_PHY_RESET (bit 0): 1=reset, 0=active
++		 */
++		if (cntl0 & (1 << 8)) {
++			pr_info("PS5:  PHY in HDMI mode, switching to DP mode");
++			/* Use dm_write_reg directly — REG_UPDATE may not stick */
++			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
++				     cntl0 & ~(1 << 8));
++			udelay(100);
++			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++			pr_info("PS5:  After HDMI->DP: CNTL0=0x%08x", cntl0);
++		}
++		if (cntl0 & 0x1) {
++			pr_info("PS5:  PHY in reset, taking out of reset");
++			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
++				     cntl0 & ~0x1);
++			udelay(1000);
++			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
++			pr_info("PS5:  After reset release: CNTL0=0x%08x", cntl0);
++		}
++	}
++
++	/* Also dump AUX_CONTROL register */
++	{
++		uint32_t aux_ctrl, aux_rx0, aux_tx;
++		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
++		aux_rx0 = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_RX_CONTROL0);
++		aux_tx = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_TX_CONTROL);
++		pr_info("PS5:  AUX_CONTROL=0x%08x AUX_DPHY_RX_CONTROL0=0x%08x AUX_DPHY_TX_CONTROL=0x%08x",
++			aux_ctrl, aux_rx0, aux_tx);
++
++		/* Fix AUX_HPD_SEL: USB-C uses HPD2 (source=2), but VBIOS may
++		 * have set HPD1 (source=1). AUX_HPD_SEL is bits 20:21.
++		 * Wrong HPD source causes AUX_RET_ERROR_HPD_DISCON.
++		 */
++		uint32_t hpd_sel = (aux_ctrl >> 20) & 3;
++		if (hpd_sel != 2) {
++			pr_info("PS5:  Fixing AUX_HPD_SEL: %d -> 2 (HPD2 for USB-C)", hpd_sel);
++			aux_ctrl = (aux_ctrl & ~(3 << 20)) | (2 << 20);
++		}
++
++		/* Set AUX_IGNORE_HPD_DISCON (bit 16) — PS5 USB-C HPD is
++		 * virtual (via ICC PD controller), not a physical HPD pin.
++		 * The AUX engine checks HPD before transactions and rejects
++		 * them with HPD_DISCON if HPD is low. Since the USB-C display
++		 * doesn't assert a physical HPD line, we must bypass this check.
++		 */
++		aux_ctrl |= (1 << 16);
++
++		/* Enable AUX engine if not already enabled (AUX_EN = bit 0) */
++		if (!(aux_ctrl & 0x1)) {
++			pr_info("PS5:  AUX engine not enabled, enabling now");
++			aux_ctrl |= 0x1;
++		}
++
++		/* Write updated AUX_CONTROL */
++		dm_write_reg(CTX, enc10->aux_regs->AUX_CONTROL, aux_ctrl);
++		udelay(100);
++		/* Read back to verify */
++		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
++		pr_info("PS5:  After AUX fix: AUX_CONTROL=0x%08x (AUX_EN=%d HPD_SEL=%d)",
++			aux_ctrl, aux_ctrl & 0x1, (aux_ctrl >> 20) & 3);
++	}
++
++	/* Check DP alt mode status */
++	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
++	pr_info("PS5:  Combo PHY DPALT_DISABLE = %d", value);
++
++	if (value == 1) {
++		/* DP alt mode is disabled. The combo PHY has not been
++		 * configured for DP alt mode (expected on PS5 since the
++		 * USB-C port is PSVR2-only and firmware doesn't init it).
++		 * Try to enable it by clearing DPALT_DISABLE.
++		 */
++		pr_info("PS5:  Enabling DP alt mode on combo PHY");
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE, 0);
++		udelay(100);
++
++		REG_GET(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE, &value);
++		pr_info("PS5:  After enable, DPALT_DISABLE = %d", value);
++		if (value == 1) {
++			pr_info("PS5:  Failed to enable DP alt mode (hardware refused)\n");
++			return false;
++		}
++	}
++
++	/* Acknowledge DP alt mode */
++	REG_UPDATE(RDPCSTX_PHY_CNTL6,
++			RDPCS_PHY_DPALT_DISABLE_ACK, 0);
++	udelay(40);
++
++	/* Verify alt mode is still active */
++	REG_GET(RDPCSTX_PHY_CNTL6,
++			RDPCS_PHY_DPALT_DISABLE, &value);
++	if (value == 1) {
++		pr_info("PS5:  DP alt mode disabled after ACK\n");
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
++		return false;
++	}
++
++	pr_info("PS5:  Combo PHY acquired for DP alt mode");
++
++	/* Dump all PHY CNTL registers for debugging */
++	{
++		uint32_t c0, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14;
++		c0 = REG_READ(RDPCSTX_PHY_CNTL0);
++		c2 = REG_READ(RDPCSTX_PHY_CNTL2);
++		c3 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL3);
++		c4 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL4);
++		c5 = REG_READ(RDPCSTX_PHY_CNTL5);
++		c6 = REG_READ(RDPCSTX_PHY_CNTL6);
++		c7 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL7);
++		c8 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL8);
++		c9 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL9);
++		c10 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL10);
++		c11 = REG_READ(RDPCSTX_PHY_CNTL11);
++		c12 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL12);
++		c13 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL13);
++		c14 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL14);
++		pr_info("PS5:  PHY CNTL0=0x%08x CNTL2=0x%08x CNTL3=0x%08x CNTL4=0x%08x",
++			c0, c2, c3, c4);
++		pr_info("PS5:  PHY CNTL5=0x%08x CNTL6=0x%08x CNTL7=0x%08x CNTL8=0x%08x",
++			c5, c6, c7, c8);
++		pr_info("PS5:  PHY CNTL9=0x%08x CNTL10=0x%08x CNTL11=0x%08x CNTL12=0x%08x",
++			c9, c10, c11, c12);
++		pr_info("PS5:  PHY CNTL13=0x%08x CNTL14=0x%08x",
++			c13, c14);
++	}
++
++	/* Enable DP reference clock for USB-C combo PHY */
++	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
++
++	return true;
++}
++
++static void dcn201_link_encoder_release_phy(struct link_encoder *enc)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++
++	if (enc->features.flags.bits.DP_IS_USB_C) {
++		REG_UPDATE(RDPCSTX_PHY_CNTL6,
++				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
++	}
++
++	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 0);
++}
++
++static void dcn201_link_encoder_enable_dp_output(
++	struct link_encoder *enc,
++	const struct dc_link_settings *link_settings,
++	enum clock_source_id clock_source)
++{
++	if (!dcn201_link_encoder_acquire_phy(enc)) {
++		pr_info("PS5:  Failed to acquire PHY for USB-C DP output\n");
++		return;
++	}
++
++	dcn10_link_encoder_enable_dp_output(enc, link_settings, clock_source);
++}
++
++static void dcn201_link_encoder_disable_output(
++	struct link_encoder *enc,
++	enum signal_type signal)
++{
++	dcn10_link_encoder_disable_output(enc, signal);
++
++	if (enc->features.flags.bits.DP_IS_USB_C &&
++	    dc_is_dp_signal(signal))
++		dcn201_link_encoder_release_phy(enc);
++}
++#endif
++
+ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+ 	.read_state = link_enc2_read_state,
+ 	.validate_output_with_stream =
+@@ -83,9 +324,14 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+ 	.hw_init = enc2_hw_init,
+ 	.setup = dcn10_link_encoder_setup,
+ 	.enable_tmds_output = dcn10_link_encoder_enable_tmds_output,
++#ifdef CONFIG_X86_PS5
++	.enable_dp_output = dcn201_link_encoder_enable_dp_output,
++	.disable_output = dcn201_link_encoder_disable_output,
++#else
+ 	.enable_dp_output = dcn10_link_encoder_enable_dp_output,
+-	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
+ 	.disable_output = dcn10_link_encoder_disable_output,
++#endif
++	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
+ 	.dp_set_lane_settings = dcn10_link_encoder_dp_set_lane_settings,
+ 	.dp_set_phy_pattern = dcn10_link_encoder_dp_set_phy_pattern,
+ 	.update_mst_stream_allocation_table =
+@@ -98,11 +344,18 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
+ 	.disable_hpd = dcn10_link_encoder_disable_hpd,
+ 	.is_dig_enabled = dcn10_is_dig_enabled,
+ 	.destroy = dcn10_link_encoder_destroy,
++#ifndef CONFIG_X86_PS5
++	/* Ignore this to prevent blackscreen. */
+ 	.fec_set_enable = enc2_fec_set_enable,
+ 	.fec_set_ready = enc2_fec_set_ready,
++#endif
+ 	.get_dig_frontend = dcn10_get_dig_frontend,
+ 	.fec_is_active = enc2_fec_is_active,
+ 	.is_in_alt_mode = dcn201_link_encoder_is_in_alt_mode,
++#ifdef CONFIG_X86_PS5
++	.acquire_phy = dcn201_link_encoder_acquire_phy,
++	.release_phy = dcn201_link_encoder_release_phy,
++#endif
+ 	.get_max_link_cap = dcn201_link_encoder_get_max_link_cap,
+ 	.get_hpd_state = dcn10_get_hpd_state,
+ 	.program_hpd_filter = dcn10_program_hpd_filter,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
+index be25e8dc0..b49448b38 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
+@@ -30,13 +30,6 @@
+ 
+ #define DPCS_DCN201_MASK_SH_LIST(mask_sh)\
+ 	DPCS_MASK_SH_LIST(mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD_EN, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD, mask_sh),\
+-	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD_EN, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DP4, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_PSTATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX1_PSTATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_MPLL_EN, mask_sh),\
+@@ -44,8 +37,10 @@
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_WIDTH, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_RATE, mask_sh),\
+ 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_WIDTH, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh),\
+-	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL11, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh)
++/* DPALT_DISABLE, DPALT_DISABLE_ACK, DPALT_DP4, DP_REF_CLK_EN
++ * are in DPCS_MASK_SH_LIST but NOT in dpcs_2_0_3_sh_mask.h.
++ * They are defined manually in LINK_ENCODER_MASK_SH_LIST_DCN201_PS5. */
+ 
+ #define DPCS_DCN201_REG_LIST(id) \
+ 	DPCS_DCN2_CMN_REG_LIST(id), \
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index 5abbf485d..fbaac888b 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -166,6 +166,9 @@ struct link_encoder_funcs {
+ 	bool (*fec_is_active)(struct link_encoder *enc);
+ 	bool (*is_in_alt_mode) (struct link_encoder *enc);
+ 
++	bool (*acquire_phy)(struct link_encoder *enc);
++	void (*release_phy)(struct link_encoder *enc);
++
+ 	void (*get_max_link_cap)(struct link_encoder *enc,
+ 		struct dc_link_settings *link_settings);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_factory.c b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
+index ae4c4ad05..118ab5c4e 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_factory.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
+@@ -620,6 +620,25 @@ static bool construct_phy(struct dc_link *link,
+ 		goto link_enc_create_fail;
+ 	}
+ 
++#ifdef CONFIG_X86_PS5
++	/* PS5: Force DP_IS_USB_C flag for USB-C DP alt mode connector.
++	 * The VBIOS reports both HDMI and USB-C as CONNECTOR_ID_DISPLAY_PORT;
++	 * the USB-C connector is enum_id=2 (HDMI is enum_id=1).
++	 */
++	if (link->link_id.id == CONNECTOR_ID_DISPLAY_PORT &&
++	    link->link_id.enum_id == ENUM_ID_2) {
++		link->link_enc->features.flags.bits.DP_IS_USB_C = 1;
++		link->link_enc->usbc_combo_phy = true;
++		pr_info("PS5:  Set DP_IS_USB_C and usbc_combo_phy for USB-C connector (enum_id=2)");
++
++		/* Log combo PHY alt mode status at init */
++		if (link->link_enc->funcs->is_in_alt_mode) {
++			bool in_alt = link->link_enc->funcs->is_in_alt_mode(link->link_enc);
++			pr_info("PS5:  Combo PHY DP alt mode at init: %s", in_alt ? "ENABLED" : "DISABLED");
++		}
++	}
++#endif
++
+ 	DC_LOG_DC("BIOS object table - DP_IS_USB_C: %d", link->link_enc->features.flags.bits.DP_IS_USB_C);
+ 	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
+index a66217e54..c52bc8cc0 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
+@@ -37,6 +37,11 @@
+ #include "link_dpcd.h"
+ #include "dm_helpers.h"
+ #include "atomfirmware.h"
++#ifdef CONFIG_X86_PS5
++#include <linux/ps5.h>
++#include "gpio_types.h"
++#include "gpio_service_interface.h"
++#endif
+ 
+ #define DC_LOGGER \
+ 	ddc_service->ctx->logger
+@@ -122,8 +127,20 @@ static void ddc_service_construct(
+ 	if (init_data->is_dpia_link ||
+ 	    dcb->funcs->get_i2c_info(dcb, init_data->id, &i2c_info) != BP_RESULT_OK) {
+ 		ddc_service->ddc_pin = NULL;
++#ifdef CONFIG_X86_PS5
++		if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
++		    init_data->id.enum_id == ENUM_ID_2)
++			pr_info("PS5:  VBIOS has no i2c_info for USB-C connector (enum_id=2)");
++#endif
+ 	} else {
+ 		DC_LOGGER_INIT(ddc_service->ctx->logger);
++#ifdef CONFIG_X86_PS5
++		if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
++		    init_data->id.enum_id == ENUM_ID_2)
++			pr_info("PS5:  VBIOS i2c_info for USB-C: i2c_line=%d engine=%d hw_assist=%d",
++				i2c_info.i2c_line, i2c_info.i2c_engine_id,
++				i2c_info.i2c_hw_assist);
++#endif
+ 		DC_LOG_DC("BIOS object table - i2c_line: %d", i2c_info.i2c_line);
+ 		DC_LOG_DC("BIOS object table - i2c_engine_id: %d", i2c_info.i2c_engine_id);
+ 
+@@ -140,6 +157,21 @@ static void ddc_service_construct(
+ 			&hw_info);
+ 	}
+ 
++#ifdef CONFIG_X86_PS5
++	/* PS5: For USB-C DP connector (enum_id=2), keep the VBIOS-assigned
++	 * DDC pin (DDC2). The DDC GPIO pins are used for AUX engine
++	 * selection — without a valid ddc_pin, the link encoder creation
++	 * crashes (array index out of bounds on channel-1).
++	 * The EDID reading the wrong display is a separate issue to
++	 * investigate (possibly AUX engine routing or combo PHY config).
++	 */
++	if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
++	    init_data->id.enum_id == ENUM_ID_2) {
++		pr_info("PS5:  USB-C connector using VBIOS DDC pin (i2c_line=%d)",
++			i2c_info.i2c_line);
++	}
++#endif
++
+ 	ddc_service->flags.EDID_QUERY_DONE_ONCE = false;
+ 	ddc_service->flags.FORCE_READ_REPEATED_START = false;
+ 	ddc_service->flags.EDID_STRESS_READ = false;
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
 index 782a45caa..444259795 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
@@ -1682,6 +2662,93 @@ index 782a45caa..444259795 100644
  		DC_TRACE_LEVEL_MESSAGE(DAL_TRACE_LEVEL_INFORMATION,
  							WPP_BIT_FLAG_DC_DETECTION_DP_CAPS,
  							"result=%u link_index=%u enum dce_version=%d DPCD=0x%04X min_hblank=%u branch_dev_id=0x%x branch_dev_name='%c%c%c%c%c%c'",
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
+index 02b7dc07a..a7d56d285 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
+@@ -65,6 +65,59 @@
+ #include "dpcs/dpcs_2_0_3_offset.h"
+ #include "dpcs/dpcs_2_0_3_sh_mask.h"
+ 
++/* PS5: dpcs_2_0_3 lacks several register offsets and field definitions
++ * that DCN201 needs. They exist in dpcs_2_0_0. Define them here.
++ */
++
++/* Missing register offsets (PHY_FUSE, DEBUG_CONFIG) */
++#ifndef mmRDPCSTX0_RDPCSTX_PHY_FUSE0
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0                   0x294f
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1                   0x2950
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2                   0x2951
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3                   0x2952
++#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3_BASE_IDX          2
++#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG                0x293d
++#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
++#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG                  0x292e
++#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0                   0x2a27
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1                   0x2a28
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2                   0x2a29
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3                   0x2a2a
++#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3_BASE_IDX          2
++#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG                0x2a15
++#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
++#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG                  0x2a06
++#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
++#endif
++
++/* PS5: dpcs_2_0_3_sh_mask.h lacks DPALT and DP_REF_CLK_EN field definitions.
++ * They exist in dpcs_2_0_0_sh_mask.h. Define them here so DPCS_MASK_SH_LIST
++ * can initialize the shift/mask structs properly for combo PHY access.
++ */
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT          0x11
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_MASK            0x00020000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT      0x12
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK_MASK        0x00040000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT              0x10
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4_MASK                0x00010000L
++#endif
++#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT          0x13
++#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN_MASK            0x00080000L
++#endif
++
+ #include "mmhub/mmhub_2_0_0_offset.h"
+ #include "mmhub/mmhub_2_0_0_sh_mask.h"
+ #include "nbio/nbio_7_4_offset.h"
+@@ -393,7 +446,8 @@ static const struct dcn10_link_enc_hpd_registers link_enc_hpd_regs[] = {
+ #define link_regs(id, phyid)\
+ [id] = {\
+ 	LE_DCN_COMMON_REG_LIST(id), \
+-	UNIPHY_DCN2_REG_LIST(phyid) \
++	UNIPHY_DCN2_REG_LIST(phyid), \
++	DPCS_DCN2_CMN_REG_LIST(id) \
+ }
+ 
+ static const struct dcn10_link_enc_registers link_enc_regs[] = {
+@@ -402,7 +456,11 @@ static const struct dcn10_link_enc_registers link_enc_regs[] = {
+ };
+ 
+ #define LINK_ENCODER_MASK_SH_LIST_DCN201(mask_sh)\
+-	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh)
++	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DP4, mask_sh),\
++	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
+ 
+ static const struct dcn10_link_enc_shift le_shift = {
+ 		LINK_ENCODER_MASK_SH_LIST_DCN201(__SHIFT)
 diff --git a/drivers/gpu/drm/amd/display/include/dal_asic_id.h b/drivers/gpu/drm/amd/display/include/dal_asic_id.h
 index 92510af1b..85c9e5878 100644
 --- a/drivers/gpu/drm/amd/display/include/dal_asic_id.h
@@ -5477,10 +6544,10 @@ index 000000000..f48ad6f92
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/ps5/hdmi.c b/drivers/ps5/hdmi.c
 new file mode 100644
-index 000000000..8f094490d
+index 000000000..652b46eee
 --- /dev/null
 +++ b/drivers/ps5/hdmi.c
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1243 @@
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 +
 +#include <linux/module.h>
@@ -6711,10 +7778,16 @@ index 000000000..8f094490d
 +void hdmi_notification_handler(struct icc_msg *msg)
 +{
 +		if (msg->data[1] == 0x02) {
++			size_t data_len = msg->length > sizeof(*msg) ?
++				msg->length - sizeof(*msg) : 0;
++
 +			fix_edid(&msg->data[4]);
 +			real_edid = drm_edid_alloc(&msg->data[4], *(u16 *)&msg->data[2]);
 +			pr_info("got real edid\n");
 +			sceHdmiOutputMode();
++
++			/* Forward EDID notification to USBC driver for USB-C EDID read */
++			ps5_usbc_handle_edid_notification(msg->data, data_len);
 +		}
 +}
 +EXPORT_SYMBOL(hdmi_notification_handler);
@@ -8853,6 +9926,999 @@ index 000000000..23de43ea4
 +MODULE_AUTHOR("Andy Nguyen");
 +MODULE_DESCRIPTION("PlayStation 5 Titania PCI Express glue driver");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/ps5/usbc.c b/drivers/ps5/usbc.c
+new file mode 100644
+index 000000000..ec444a62b
+--- /dev/null
++++ b/drivers/ps5/usbc.c
+@@ -0,0 +1,987 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * PS5 USB-C DP alt mode driver
++ *
++ * Communicates with the south bridge EMC FW via ICC USBC service
++ * (service_id 0x12) to manage USB-C DisplayPort alternate mode.
++ *
++ * The EMC FW handles PD negotiation and mux configuration in firmware.
++ * This driver queries connection state, receives hotplug notifications,
++ * and forwards HPD events to the amdgpu display driver.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/ps5.h>
++#include <linux/workqueue.h>
++#include <linux/spinlock.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/kstrtox.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++
++/* ICC USBC msg_type values.
++ *
++ * All values confirmed from PS5 5.50 firmware kernel dump disassembly.
++ */
++static ushort msg_type_get_service_state = 0x00;
++module_param(msg_type_get_service_state, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_service_state, "ICC USBC GET_SERVICE_STATE msg_type");
++
++static ushort msg_type_get_port_list = 0x01;
++module_param(msg_type_get_port_list, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_port_list, "ICC USBC GET_PORT_LIST msg_type");
++
++static ushort msg_type_get_dev_conn_state = 0x0c;
++module_param(msg_type_get_dev_conn_state, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_dev_conn_state, "ICC USBC GET_DEV_CONN_STATE msg_type");
++
++static ushort msg_type_set_pdcon_op_mode = 0x10;
++module_param(msg_type_set_pdcon_op_mode, ushort, 0644);
++MODULE_PARM_DESC(msg_type_set_pdcon_op_mode, "ICC USBC SET_PDCON_OP_MODE msg_type");
++
++static ushort msg_type_get_pdcon_op_mode = 0x11;
++module_param(msg_type_get_pdcon_op_mode, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_pdcon_op_mode, "ICC USBC GET_PDCON_OP_MODE msg_type");
++
++static ushort msg_type_set_opt_pdp_enable = 0x12;
++module_param(msg_type_set_opt_pdp_enable, ushort, 0644);
++MODULE_PARM_DESC(msg_type_set_opt_pdp_enable, "ICC USBC SET_OPT_PDP_ENABLE msg_type");
++
++static ushort msg_type_notify_soc_working = 0x15;
++module_param(msg_type_notify_soc_working, ushort, 0644);
++MODULE_PARM_DESC(msg_type_notify_soc_working, "ICC USBC NOTIFY_SOC_WORKING msg_type");
++
++static ushort msg_type_notify_soc_download_standby = 0x16;
++module_param(msg_type_notify_soc_download_standby, ushort, 0644);
++MODULE_PARM_DESC(msg_type_notify_soc_download_standby, "ICC USBC NOTIFY_SOC_DOWNLOAD_STANDBY msg_type");
++
++static ushort msg_type_set_supported_device_list = 0x19;
++module_param(msg_type_set_supported_device_list, ushort, 0644);
++MODULE_PARM_DESC(msg_type_set_supported_device_list, "ICC USBC SET_SUPPORTED_DEVICE_LIST msg_type");
++
++static ushort msg_type_get_pdcon_ic_type = 0x1b;
++module_param(msg_type_get_pdcon_ic_type, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_pdcon_ic_type, "ICC USBC GET_PDCON_IC_TYPE msg_type");
++
++static ushort msg_type_get_pdcon_fw_ver = 0x1c;
++module_param(msg_type_get_pdcon_fw_ver, ushort, 0644);
++MODULE_PARM_DESC(msg_type_get_pdcon_fw_ver, "ICC USBC GET_PDCON_FW_VER msg_type");
++
++static ushort msg_type_set_redriver_eqval = 0x20;
++module_param(msg_type_set_redriver_eqval, ushort, 0644);
++MODULE_PARM_DESC(msg_type_set_redriver_eqval, "ICC USBC SET_REDRIVER_EQVAL msg_type");
++
++/* OpMode for SET_PDCON_OP_MODE.
++ * 5 = USB + DP (current value used by existing patch).
++ * The PS5 OS also uses OpMode 4 in some contexts.
++ */
++static ushort pdcon_op_mode = 5;
++module_param(pdcon_op_mode, ushort, 0644);
++MODULE_PARM_DESC(pdcon_op_mode, "PDCON OpMode (5=USB+DP, 4=USB only?)");
++
++/* Enable value for SET_OPT_PDP_ENABLE.
++ * 1 = enable DP power delivery (confirmed from firmware disassembly).
++ * 2 = also accepted by firmware (meaning unclear, possibly disable or alt mode).
++ */
++static ushort opt_pdp_enable = 1;
++module_param(opt_pdp_enable, ushort, 0644);
++MODULE_PARM_DESC(opt_pdp_enable, "SET_OPT_PDP_ENABLE value (1=enable, 2=alt)");
++
++/* Port ID for ICC USBC commands.
++ * The PS5 has one USB-C port. GET_DEV_CONN_STATE reply shows PortId=3
++ * when queried with port_id=0. Try 3 if commands to port 0 don't work.
++ * The PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE.
++ */
++static ushort usbc_port_id = 0;
++module_param(usbc_port_id, ushort, 0644);
++MODULE_PARM_DESC(usbc_port_id, "USB-C port ID for ICC commands (0 or 3)");
++
++/* Notification msg_type for connection state change.
++ * Based on the pattern (HDMI: 0x02, BUTTON: 0x8010/0x8011).
++ * USBC notifications likely use 0x80xx.
++ */
++static ushort notif_msg_type_conn_state = 0x8001;
++module_param(notif_msg_type_conn_state, ushort, 0644);
++MODULE_PARM_DESC(notif_msg_type_conn_state, "USBC notification msg_type for connection state change");
++
++/* HPD callback registered by amdgpu_dm */
++static ps5_usbc_hpd_callback_t hpd_callback;
++static void *hpd_callback_data;
++static DEFINE_SPINLOCK(hpd_callback_lock);
++
++/* Dedicated workqueue for HPD events (dc_link_detect can sleep) */
++static struct workqueue_struct *hpd_wq;
++static struct work_struct hpd_connect_work;
++static struct work_struct hpd_disconnect_work;
++
++/* Polling state for connection monitoring (fallback if notifications don't work) */
++static struct delayed_work usbc_poll_work;
++static bool poll_enabled = true;
++module_param(poll_enabled, bool, 0644);
++MODULE_PARM_DESC(poll_enabled, "Enable connection state polling fallback");
++
++static unsigned int poll_interval_ms = 500;
++module_param(poll_interval_ms, uint, 0644);
++MODULE_PARM_DESC(poll_interval_ms, "Connection state poll interval in ms");
++
++/* Last known connection state for change detection */
++static struct ps5_usbc_conn_state last_conn_state;
++static bool last_conn_state_valid;
++
++/* Debug: last raw notification */
++static u8 last_notif[ICC_MSG_MAX_SIZE];
++static size_t last_notif_len;
++static DEFINE_SPINLOCK(notif_lock);
++
++/* ICC HDMI service ID for EDID read (PS5 firmware uses HDMI ICC service
++ * for ALL display communication, including USB-C/PSVR2).
++ */
++#define ICC_HDMI_SERVICE_ID 0x10
++
++/* ICC HDMI EDID read command data[0] value (from firmware disassembly).
++ * The firmware sends this via ICC to the south bridge, which reads EDID
++ * from the connected display and sends it back via ICC notification.
++ */
++#define ICC_HDMI_CMD_READ_EDID 4
++
++/* I2C EDID address used by firmware (0x7c — south bridge internal,
++ * not standard I2C 0xA0/0x50).
++ */
++#define ICC_HDMI_EDID_I2C_ADDR 0x7c
++
++/* EDID notification handling: the south bridge sends EDID via ICC
++ * notification (service_id=0x10, data[1]=0x02) after receiving the
++ * EDID read query. We use a completion to synchronize.
++ */
++static struct completion usbc_edid_done;
++static u8 usbc_edid_buf[512];
++static size_t usbc_edid_len;
++static bool usbc_edid_pending;
++static DEFINE_MUTEX(usbc_edid_lock);
++
++/* Forward declarations */
++static void fire_hpd_event(enum ps5_usbc_hpd_event event);
++
++/* Dumps the connection state in the format matching the PS5 firmware:
++ * PortId, ConnState, DevType, VconnReq, Power, Mux, Orient, DpAlt, PinAssign, Hpd
++ */
++static void dump_conn_state(const struct ps5_usbc_conn_state *s, const char *prefix)
++{
++	pr_info("[USBC] %s PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
++		prefix, s->port_id, s->conn_state, s->dev_type,
++		s->vconn_req, s->power, s->mux, s->orient,
++		s->dp_alt, s->pin_assign, s->hpd);
++}
++
++/* Build and send an ICC USBC query, returning the reply */
++static int usbc_query(u16 msg_type, u8 port_id, u8 *reply, size_t reply_size)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++	int ret;
++
++	if (!spcie_is_initialized())
++		return -ENODEV;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = msg_type;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = port_id;
++
++	ret = icc_query(buf, buf);
++	if (ret)
++		return ret;
++
++	if (reply && reply_size > 0) {
++		msg = (struct icc_msg *)buf;
++		if (msg->length > sizeof(*msg)) {
++			size_t copy_len = min_t(size_t, msg->length - sizeof(*msg), reply_size);
++			memcpy(reply, msg->data, copy_len);
++		}
++	}
++
++	return 0;
++}
++
++int ps5_usbc_get_conn_state(u8 port_id, struct ps5_usbc_conn_state *state)
++{
++	u8 reply[ICC_MSG_MAX_SIZE];
++	int ret;
++
++	if (!state)
++		return -EINVAL;
++
++	ret = usbc_query(msg_type_get_dev_conn_state, port_id, reply, sizeof(reply));
++	if (ret) {
++		pr_err("GET_DEV_CONN_STATE [NG][%d] PortId(%02X)\n", ret, port_id);
++		return ret;
++	}
++
++	/* Reply data layout (from PS5 firmware dump format string).
++	 * The first 2 bytes of reply data are a status/header (00 00 = OK).
++	 * Actual connection state starts at data[2].
++	 * data[0] = status_hi
++	 * data[1] = status_lo
++	 * data[2] = PortId
++	 * data[3] = ConnState
++	 * data[4] = DevType
++	 * data[5] = VconnReq
++	 * data[6] = Power
++	 * data[7] = Mux
++	 * data[8] = Orient
++	 * data[9] = DpAlt
++	 * data[10] = PinAssign
++	 * data[11] = Hpd
++	 */
++	state->port_id = reply[2];
++	state->conn_state = reply[3];
++	state->dev_type = reply[4];
++	state->vconn_req = reply[5];
++	state->power = reply[6];
++	state->mux = reply[7];
++	state->orient = reply[8];
++	state->dp_alt = reply[9];
++	state->pin_assign = reply[10];
++	state->hpd = reply[11];
++
++	dump_conn_state(state, "GET_DEV_CONN_STATE [OK]");
++	return 0;
++}
++EXPORT_SYMBOL(ps5_usbc_get_conn_state);
++
++int ps5_usbc_set_pdcon_op_mode(u8 port_id, u8 op_mode)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = msg_type_set_pdcon_op_mode;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = port_id;
++	msg->data[1] = op_mode;
++
++	pr_info("[USBC] SET_PDCON_OP_MODE PortId(%02X) OpMode(%u)\n", port_id, op_mode);
++
++	return icc_query(buf, buf);
++}
++EXPORT_SYMBOL(ps5_usbc_set_pdcon_op_mode);
++
++int ps5_usbc_set_opt_pdp_enable(u8 port_id, u8 enable)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = msg_type_set_opt_pdp_enable;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = port_id;
++	msg->data[1] = enable;
++
++	pr_info("[USBC] SET_OPT_PDP_ENABLE PortId(%02X) Enable(%u)\n", port_id, enable);
++
++	return icc_query(buf, buf);
++}
++EXPORT_SYMBOL(ps5_usbc_set_opt_pdp_enable);
++
++int ps5_usbc_notify_soc_working(u8 port_id)
++{
++	pr_info("[USBC] NOTIFY_SOC_WORKING PortId(%02X)\n", port_id);
++	return usbc_query(msg_type_notify_soc_working, port_id, NULL, 0);
++}
++EXPORT_SYMBOL(ps5_usbc_notify_soc_working);
++
++int ps5_usbc_set_supported_device_list(u8 port_id, const u8 *devices, u8 device_num)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++	int i;
++
++	if (device_num > 8)
++		return -EINVAL;
++
++	msg->service_id = ICC_SERVICE_ID_USBC;
++	msg->msg_type = msg_type_set_supported_device_list;
++	msg->length = ICC_MSG_MIN_SIZE;
++	msg->data[0] = port_id;
++	msg->data[1] = device_num;
++
++	/* Each device entry is 3 bytes (from firmware disassembly:
++	 * lea rcx, [rax + rax*2] = device_num * 3)
++	 */
++	for (i = 0; i < device_num && i < 8; i++) {
++		msg->data[2 + i * 3] = devices[i];
++		msg->length += 3;
++	}
++
++	pr_info("[USBC] SET_SUPPORTED_DEVICE_LIST PortId(%02X) DeviceNum(%02X)\n",
++		port_id, device_num);
++
++	return icc_query(buf, buf);
++}
++EXPORT_SYMBOL(ps5_usbc_set_supported_device_list);
++
++/* Handle EDID notification from ICC HDMI service.
++ * Called by hdmi_notification_handler when an EDID notification arrives
++ * (msg->data[1] == 0x02). The EDID data is at data[4] with length at
++ * data[2:3] (u16 LE).
++ */
++void ps5_usbc_handle_edid_notification(const u8 *data, size_t data_len)
++{
++	u16 edid_len;
++
++	if (data_len < 4)
++		return;
++
++	/* Check if this is an EDID notification (data[1] == 0x02) */
++	if (data[1] != 0x02)
++		return;
++
++	edid_len = *(const u16 *)&data[2];
++	if (edid_len == 0 || edid_len > sizeof(usbc_edid_buf))
++		return;
++
++	if (data_len < 4 + edid_len)
++		return;
++
++	mutex_lock(&usbc_edid_lock);
++	if (usbc_edid_pending) {
++		memcpy(usbc_edid_buf, &data[4], edid_len);
++		usbc_edid_len = edid_len;
++		usbc_edid_pending = false;
++		complete(&usbc_edid_done);
++		pr_info("[USBC] EDID notification received (%u bytes)\n", edid_len);
++	}
++	mutex_unlock(&usbc_edid_lock);
++}
++EXPORT_SYMBOL(ps5_usbc_handle_edid_notification);
++
++/* Read EDID from USB-C display via ICC.
++ *
++ * The PS5 firmware uses ICC (service_id=0x10, HDMI service) for all
++ * display communication. The GPU's AUX engine is NOT used for USB-C.
++ * This function:
++ * 1. Sends ICC EDID read query to the south bridge
++ * 2. Waits for EDID notification (data[1]==0x02)
++ * 3. Returns EDID data
++ *
++ * Based on firmware disassembly at offset 0x0090fa90.
++ */
++int ps5_usbc_read_edid(u8 *edid, size_t max_len)
++{
++	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	struct icc_msg *msg = (struct icc_msg *)buf;
++	int ret;
++	unsigned long timeout;
++
++	if (!edid || max_len < EDID_LENGTH)
++		return -EINVAL;
++
++	if (!spcie_is_initialized())
++		return -ENODEV;
++
++	/* Prepare for EDID notification */
++	mutex_lock(&usbc_edid_lock);
++	usbc_edid_pending = true;
++	usbc_edid_len = 0;
++	reinit_completion(&usbc_edid_done);
++	mutex_unlock(&usbc_edid_lock);
++
++	/* Build ICC HDMI EDID read query.
++	 * Format from firmware disassembly (offset 0x0090fc87):
++	 *   service_id = 0x10 (HDMI)
++	 *   msg_type   = 0
++	 *   length     = 0x20 (32 bytes total)
++	 *   data[0]    = 4 (EDID read command)
++	 *   data[1:2]  = 0x000c
++	 *   data[3]    = 1
++	 *   data[4]    = 1
++	 *   data[5]    = 8
++	 *   data[6]    = 1
++	 *   data[7]    = 1
++	 *   data[8]    = 1
++	 *   data[9]    = 0x7c (I2C EDID address)
++	 *   data[10]   = 0
++	 */
++	msg->service_id = ICC_HDMI_SERVICE_ID;
++	msg->msg_type = 0;
++	msg->length = 0x20;
++	msg->data[0] = ICC_HDMI_CMD_READ_EDID;
++	*(u16 *)&msg->data[1] = 0x000c;
++	msg->data[3] = 1;
++	msg->data[4] = 1;
++	msg->data[5] = 8;
++	msg->data[6] = 1;
++	msg->data[7] = 1;
++	msg->data[8] = 1;
++	msg->data[9] = ICC_HDMI_EDID_I2C_ADDR;
++	msg->data[10] = 0;
++
++	pr_info("[USBC] Sending ICC HDMI EDID read query\n");
++
++	ret = icc_query(buf, buf);
++	if (ret) {
++		pr_err("[USBC] ICC EDID read query failed: %d\n", ret);
++		mutex_lock(&usbc_edid_lock);
++		usbc_edid_pending = false;
++		mutex_unlock(&usbc_edid_lock);
++		return ret;
++	}
++
++	/* Check query reply status.
++	 * The reply should have:
++	 *   service_id = 0x10
++	 *   msg_type   = 0x4000 (reply)
++	 *   data[0]    = 0 (status OK)
++	 *   data[1]    = 0 (status OK)
++	 */
++	{
++		struct icc_msg *reply = (struct icc_msg *)buf;
++		size_t reply_data_len = reply->length > sizeof(*reply) ?
++			reply->length - sizeof(*reply) : 0;
++
++		pr_info("[USBC] ICC EDID reply: service_id=0x%02x msg_type=0x%04x length=%u data_len=%zu\n",
++			reply->service_id, reply->msg_type, reply->length, reply_data_len);
++
++		if (reply_data_len > 0) {
++			print_hex_dump(KERN_INFO, "[USBC] EDID reply: ", DUMP_PREFIX_OFFSET,
++				       16, 1, reply->data, min_t(size_t, reply_data_len, 64), true);
++		}
++
++		/* Check if EDID data is in the reply directly */
++		if (reply_data_len >= 4 && reply->data[0] == 0 && reply->data[1] == 0) {
++			/* Status OK — EDID might be in the reply or come via notification */
++			if (reply_data_len > 8) {
++				/* Check if data[8] looks like EDID (0x00 = EDID header byte 1) */
++				if (reply->data[8] == 0x00 || reply->data[8] == 0xff) {
++					size_t edid_len = reply_data_len - 8;
++					if (edid_len <= max_len && edid_len >= EDID_LENGTH) {
++						memcpy(edid, &reply->data[8], edid_len);
++						pr_info("[USBC] EDID from reply (%zu bytes)\n", edid_len);
++						mutex_lock(&usbc_edid_lock);
++						usbc_edid_pending = false;
++						mutex_unlock(&usbc_edid_lock);
++						return edid_len;
++					}
++				}
++			}
++		}
++	}
++
++	/* EDID not in reply — wait for ICC notification */
++	pr_info("[USBC] Waiting for EDID notification...\n");
++	timeout = wait_for_completion_timeout(&usbc_edid_done,
++					      msecs_to_jiffies(3000));
++	mutex_lock(&usbc_edid_lock);
++	usbc_edid_pending = false;
++	if (timeout == 0) {
++		pr_err("[USBC] EDID notification timeout\n");
++		mutex_unlock(&usbc_edid_lock);
++		return -ETIMEDOUT;
++	}
++
++	if (usbc_edid_len == 0) {
++		mutex_unlock(&usbc_edid_lock);
++		return -ENODATA;
++	}
++
++	if (usbc_edid_len > max_len)
++		usbc_edid_len = max_len;
++
++	memcpy(edid, usbc_edid_buf, usbc_edid_len);
++	pr_info("[USBC] EDID from notification (%zu bytes)\n", usbc_edid_len);
++	mutex_unlock(&usbc_edid_lock);
++
++	return usbc_edid_len;
++}
++EXPORT_SYMBOL(ps5_usbc_read_edid);
++
++int ps5_usbc_register_hpd_callback(ps5_usbc_hpd_callback_t callback, void *data)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&hpd_callback_lock, flags);
++	hpd_callback = callback;
++	hpd_callback_data = data;
++	spin_unlock_irqrestore(&hpd_callback_lock, flags);
++
++	pr_info("[USBC] HPD callback registered\n");
++
++	/* If a device is already connected, fire CONNECT immediately.
++	 * The USBC driver loads before amdgpu, so the initial connection
++	 * state is captured before the callback is registered.
++	 */
++	if (last_conn_state_valid && last_conn_state.dp_alt &&
++	    last_conn_state.conn_state) {
++		pr_info("[USBC] Device already connected, firing initial HPD CONNECT\n");
++		fire_hpd_event(PS5_USBC_HPD_CONNECT);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(ps5_usbc_register_hpd_callback);
++
++void ps5_usbc_unregister_hpd_callback(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&hpd_callback_lock, flags);
++	hpd_callback = NULL;
++	hpd_callback_data = NULL;
++	spin_unlock_irqrestore(&hpd_callback_lock, flags);
++
++	pr_info("[USBC] HPD callback unregistered\n");
++}
++EXPORT_SYMBOL(ps5_usbc_unregister_hpd_callback);
++
++bool ps5_usbc_is_dp_alt_active(u8 port_id)
++{
++	struct ps5_usbc_conn_state state;
++	int ret;
++
++	ret = ps5_usbc_get_conn_state(port_id, &state);
++	if (ret)
++		return false;
++
++	return state.dp_alt != 0 && state.conn_state != 0;
++}
++EXPORT_SYMBOL(ps5_usbc_is_dp_alt_active);
++
++static void hpd_connect_work_fn(struct work_struct *work)
++{
++	ps5_usbc_hpd_callback_t cb;
++	void *cb_data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hpd_callback_lock, flags);
++	cb = hpd_callback;
++	cb_data = hpd_callback_data;
++	spin_unlock_irqrestore(&hpd_callback_lock, flags);
++
++	if (cb) {
++		pr_info("[USBC] Firing HPD CONNECT\n");
++		cb(PS5_USBC_HPD_CONNECT, cb_data);
++	}
++}
++
++static void hpd_disconnect_work_fn(struct work_struct *work)
++{
++	ps5_usbc_hpd_callback_t cb;
++	void *cb_data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hpd_callback_lock, flags);
++	cb = hpd_callback;
++	cb_data = hpd_callback_data;
++	spin_unlock_irqrestore(&hpd_callback_lock, flags);
++
++	if (cb) {
++		pr_info("[USBC] Firing HPD DISCONNECT\n");
++		cb(PS5_USBC_HPD_DISCONNECT, cb_data);
++	}
++}
++
++static void fire_hpd_event(enum ps5_usbc_hpd_event event)
++{
++	if (!hpd_wq)
++		return;
++
++	switch (event) {
++	case PS5_USBC_HPD_CONNECT:
++		queue_work(hpd_wq, &hpd_connect_work);
++		break;
++	case PS5_USBC_HPD_DISCONNECT:
++		queue_work(hpd_wq, &hpd_disconnect_work);
++		break;
++	case PS5_USBC_HPD_IRQ:
++		queue_work(hpd_wq, &hpd_connect_work);
++		break;
++	default:
++		break;
++	}
++}
++
++/* Manually trigger HPD (for testing/debug) */
++void ps5_usbc_trigger_hpd(void)
++{
++	struct ps5_usbc_conn_state state;
++	int ret;
++
++	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
++	if (ret) {
++		pr_warn("[USBC] trigger_hpd: failed to get conn state\n");
++		return;
++	}
++
++	/* Fire CONNECT when DP alt mode is active (DpAlt=1 and ConnState=1).
++	 * The Hpd field may be 0 initially — the display asserts HPD after
++	 * link training starts. We trigger CONNECT to begin that process.
++	 */
++	if (state.dp_alt && state.conn_state)
++		fire_hpd_event(PS5_USBC_HPD_CONNECT);
++	else
++		fire_hpd_event(PS5_USBC_HPD_DISCONNECT);
++}
++EXPORT_SYMBOL(ps5_usbc_trigger_hpd);
++
++/* Notification handler - called from spcie.c icc_notification_work_func */
++void usbc_notification_handler(struct icc_msg *msg)
++{
++	unsigned long flags;
++	enum ps5_usbc_hpd_event event = PS5_USBC_HPD_NONE;
++
++	/* Save raw notification for debug */
++	spin_lock_irqsave(&notif_lock, flags);
++	last_notif_len = min_t(size_t, msg->length, ICC_MSG_MAX_SIZE);
++	memcpy(last_notif, msg, last_notif_len);
++	spin_unlock_irqrestore(&notif_lock, flags);
++
++	pr_info("[USBC] notification msg_type=0x%04X len=%u\n",
++		msg->msg_type, msg->length);
++
++	if (msg->length > sizeof(*msg)) {
++		print_hex_dump(KERN_INFO, "[USBC] notif: ", DUMP_PREFIX_OFFSET,
++			       16, 1, msg->data, msg->length - sizeof(*msg), true);
++	}
++
++	/* Parse notification based on msg_type.
++	 * The notification data likely contains the same fields as
++	 * GET_DEV_CONN_STATE reply: PortId, ConnState, DevType, ...,
++	 * DpAlt, PinAssign, Hpd.
++	 */
++	if (msg->msg_type == notif_msg_type_conn_state) {
++		struct ps5_usbc_conn_state state = {};
++		u8 *d = msg->data;
++		size_t data_len = msg->length > sizeof(*msg) ?
++			msg->length - sizeof(*msg) : 0;
++
++		if (data_len >= 12) {
++			/* Skip 2-byte status header, same as GET_DEV_CONN_STATE */
++			state.port_id = d[2];
++			state.conn_state = d[3];
++			state.dev_type = d[4];
++			state.vconn_req = d[5];
++			state.power = d[6];
++			state.mux = d[7];
++			state.orient = d[8];
++			state.dp_alt = d[9];
++			state.pin_assign = d[10];
++			state.hpd = d[11];
++
++			dump_conn_state(&state, "notification");
++
++			if (state.dp_alt && state.conn_state)
++				event = PS5_USBC_HPD_CONNECT;
++			else
++				event = PS5_USBC_HPD_DISCONNECT;
++		}
++	} else {
++		/* Unknown notification msg_type - try to parse as conn state anyway */
++		u8 *d = msg->data;
++		size_t data_len = msg->length > sizeof(*msg) ?
++			msg->length - sizeof(*msg) : 0;
++
++		if (data_len >= 12) {
++			pr_info("[USBC] unknown notif, trying conn state parse:\n");
++			pr_info("[USBC]   PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
++				d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11]);
++
++			if (d[9] /* dp_alt */ && d[3] /* conn_state */)
++				event = PS5_USBC_HPD_CONNECT;
++			else
++				event = PS5_USBC_HPD_DISCONNECT;
++		}
++	}
++
++	if (event != PS5_USBC_HPD_NONE)
++		fire_hpd_event(event);
++}
++EXPORT_SYMBOL(usbc_notification_handler);
++
++/* Polling workqueue - fallback for connection state monitoring */
++static void usbc_poll_fn(struct work_struct *work)
++{
++	struct ps5_usbc_conn_state state;
++	int ret;
++
++	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
++	if (ret) {
++		schedule_delayed_work(&usbc_poll_work,
++				      msecs_to_jiffies(poll_interval_ms));
++		return;
++	}
++
++	if (!last_conn_state_valid) {
++		last_conn_state = state;
++		last_conn_state_valid = true;
++		/* If already connected at boot, fire connect event */
++		if (state.dp_alt && state.conn_state)
++			fire_hpd_event(PS5_USBC_HPD_CONNECT);
++	} else {
++		/* Detect changes in dp_alt + conn_state (connection status) */
++		bool was_connected = last_conn_state.dp_alt && last_conn_state.conn_state;
++		bool is_connected = state.dp_alt && state.conn_state;
++
++		if (is_connected && !was_connected)
++			fire_hpd_event(PS5_USBC_HPD_CONNECT);
++		else if (!is_connected && was_connected)
++			fire_hpd_event(PS5_USBC_HPD_DISCONNECT);
++
++		last_conn_state = state;
++	}
++
++	schedule_delayed_work(&usbc_poll_work, msecs_to_jiffies(poll_interval_ms));
++}
++
++/* Probe interface - try a msg_type and log the result */
++int ps5_usbc_probe_msg_type(u16 msg_type, u8 port_id, u8 *reply, size_t reply_size)
++{
++	pr_info("[USBC] probing msg_type=0x%04X PortId(%02X)\n", msg_type, port_id);
++	return usbc_query(msg_type, port_id, reply, reply_size);
++}
++EXPORT_SYMBOL(ps5_usbc_probe_msg_type);
++
++/* DebugFS interface */
++static struct dentry *usbc_debugfs_dir;
++
++static int usbc_debugfs_conn_state_show(struct seq_file *m, void *data)
++{
++	struct ps5_usbc_conn_state state;
++	int ret;
++
++	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
++	if (ret) {
++		seq_printf(m, "GET_DEV_CONN_STATE failed: %d\n", ret);
++		return 0;
++	}
++
++	seq_printf(m, "PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
++		state.port_id, state.conn_state, state.dev_type,
++		state.vconn_req, state.power, state.mux, state.orient,
++		state.dp_alt, state.pin_assign, state.hpd);
++	seq_printf(m, "DP alt mode active: %s\n",
++		(state.dp_alt && state.conn_state) ? "yes" : "no");
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(usbc_debugfs_conn_state);
++
++static int usbc_debugfs_last_notif_show(struct seq_file *m, void *data)
++{
++	unsigned long flags;
++	u8 buf[ICC_MSG_MAX_SIZE];
++	size_t len;
++	struct icc_msg *msg;
++	u8 *d;
++	size_t data_len;
++	int i;
++
++	spin_lock_irqsave(&notif_lock, flags);
++	len = last_notif_len;
++	memcpy(buf, last_notif, len);
++	spin_unlock_irqrestore(&notif_lock, flags);
++
++	if (len == 0) {
++		seq_puts(m, "No notifications received yet\n");
++		return 0;
++	}
++
++	msg = (struct icc_msg *)buf;
++	seq_printf(m, "msg_type=0x%04X length=%u\n", msg->msg_type, msg->length);
++	data_len = len > sizeof(*msg) ? len - sizeof(*msg) : 0;
++	d = msg->data;
++	seq_printf(m, "data (%zu bytes):", data_len);
++	for (i = 0; i < data_len; i++)
++		seq_printf(m, " %02x", d[i]);
++	seq_putc(m, '\n');
++
++	if (data_len >= 10) {
++		seq_printf(m, "Parsed: PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
++			d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(usbc_debugfs_last_notif);
++
++static ssize_t usbc_debugfs_probe_write(struct file *file, const char __user *buf,
++					size_t count, loff_t *ppos)
++{
++	char input[32];
++	u16 msg_type;
++	u8 reply[ICC_MSG_MAX_SIZE];
++	int ret;
++	size_t reply_len;
++
++	if (count >= sizeof(input))
++		return -EINVAL;
++	if (copy_from_user(input, buf, count))
++		return -EFAULT;
++	input[count] = 0;
++
++	if (kstrtou16(input, 0, &msg_type))
++		return -EINVAL;
++
++	ret = ps5_usbc_probe_msg_type(msg_type, 0, reply, sizeof(reply));
++	if (ret) {
++		pr_info("[USBC] probe msg_type=0x%04X FAILED: %d\n", msg_type, ret);
++		return count;
++	}
++
++	reply_len = min_t(size_t, sizeof(reply), 32);
++	pr_info("[USBC] probe msg_type=0x%04X OK reply:", msg_type);
++	print_hex_dump(KERN_INFO, "[USBC]   ", DUMP_PREFIX_OFFSET,
++		       16, 1, reply, reply_len, true);
++	return count;
++}
++
++static const struct file_operations usbc_debugfs_probe_fops = {
++	.owner = THIS_MODULE,
++	.write = usbc_debugfs_probe_write,
++};
++
++static ssize_t usbc_debugfs_trigger_hpd_write(struct file *file, const char __user *buf,
++					       size_t count, loff_t *ppos)
++{
++	ps5_usbc_trigger_hpd();
++	return count;
++}
++
++static const struct file_operations usbc_debugfs_trigger_hpd_fops = {
++	.owner = THIS_MODULE,
++	.write = usbc_debugfs_trigger_hpd_write,
++};
++
++static ssize_t usbc_debugfs_read_edid_write(struct file *file, const char __user *buf,
++					     size_t count, loff_t *ppos)
++{
++	u8 edid[512];
++	int ret;
++
++	ret = ps5_usbc_read_edid(edid, sizeof(edid));
++	if (ret < 0) {
++		pr_info("[USBC] debugfs read_edid FAILED: %d\n", ret);
++		return count;
++	}
++
++	pr_info("[USBC] debugfs read_edid OK (%d bytes):\n", ret);
++	print_hex_dump(KERN_INFO, "[USBC] EDID: ", DUMP_PREFIX_OFFSET,
++		       16, 1, edid, min_t(int, ret, 256), true);
++	return count;
++}
++
++static const struct file_operations usbc_debugfs_read_edid_fops = {
++	.owner = THIS_MODULE,
++	.write = usbc_debugfs_read_edid_write,
++};
++
++static struct delayed_work usbc_init_work;
++static bool usbc_initialized;
++
++static void ps5_usbc_do_init(struct work_struct *work)
++{
++	int ret;
++
++	init_completion(&usbc_edid_done);
++
++	if (!spcie_is_initialized()) {
++		pr_info("[USBC] spcie not initialized, retrying in 1s\n");
++		schedule_delayed_work(&usbc_init_work, msecs_to_jiffies(1000));
++		return;
++	}
++
++	/* Create dedicated HPD workqueue (dc_link_detect can sleep) */
++	hpd_wq = alloc_workqueue("ps5_usbc_hpd", WQ_UNBOUND, 0);
++	INIT_WORK(&hpd_connect_work, hpd_connect_work_fn);
++	INIT_WORK(&hpd_disconnect_work, hpd_disconnect_work_fn);
++
++	/* Enable DP alt mode on the USB-C port */
++	ret = ps5_usbc_set_pdcon_op_mode((u8)usbc_port_id, (u8)pdcon_op_mode);
++	if (ret)
++		pr_warn("[USBC] SET_PDCON_OP_MODE failed: %d\n", ret);
++
++	/* Enable DP power delivery (OPT_PDP_ENABLE) */
++	ret = ps5_usbc_set_opt_pdp_enable((u8)usbc_port_id, (u8)opt_pdp_enable);
++	if (ret)
++		pr_warn("[USBC] SET_OPT_PDP_ENABLE failed: %d\n", ret);
++
++	/* Notify SOC that we're working */
++	ret = ps5_usbc_notify_soc_working((u8)usbc_port_id);
++	if (ret)
++		pr_warn("[USBC] NOTIFY_SOC_WORKING failed: %d\n", ret);
++
++	/* Get initial connection state */
++	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &last_conn_state);
++	if (ret) {
++		pr_warn("[USBC] initial GET_DEV_CONN_STATE failed: %d\n", ret);
++		last_conn_state_valid = false;
++	} else {
++		last_conn_state_valid = true;
++		if (last_conn_state.dp_alt && last_conn_state.conn_state)
++			pr_info("[USBC] DP alt mode active at boot\n");
++		else
++			pr_info("[USBC] DP alt mode not active at boot\n");
++	}
++
++	/* Start polling for connection state changes */
++	if (poll_enabled) {
++		INIT_DELAYED_WORK(&usbc_poll_work, usbc_poll_fn);
++		schedule_delayed_work(&usbc_poll_work,
++				      msecs_to_jiffies(poll_interval_ms));
++	}
++
++	/* Create debugfs interface */
++	usbc_debugfs_dir = debugfs_create_dir("ps5_usbc", NULL);
++	if (usbc_debugfs_dir) {
++		debugfs_create_file("conn_state", 0444, usbc_debugfs_dir, NULL,
++				    &usbc_debugfs_conn_state_fops);
++		debugfs_create_file("last_notif", 0444, usbc_debugfs_dir, NULL,
++				    &usbc_debugfs_last_notif_fops);
++		debugfs_create_file("probe", 0220, usbc_debugfs_dir, NULL,
++				    &usbc_debugfs_probe_fops);
++		debugfs_create_file("trigger_hpd", 0220, usbc_debugfs_dir, NULL,
++				    &usbc_debugfs_trigger_hpd_fops);
++		debugfs_create_file("read_edid", 0220, usbc_debugfs_dir, NULL,
++				    &usbc_debugfs_read_edid_fops);
++	}
++
++	usbc_initialized = true;
++	pr_info("[USBC] PS5 USB-C DP alt mode driver initialized\n");
++}
++
++static int __init ps5_usbc_init(void)
++{
++	INIT_DELAYED_WORK(&usbc_init_work, ps5_usbc_do_init);
++	schedule_delayed_work(&usbc_init_work, msecs_to_jiffies(1000));
++	return 0;
++}
++
++static void __exit ps5_usbc_exit(void)
++{
++	cancel_delayed_work_sync(&usbc_init_work);
++
++	if (usbc_initialized && poll_enabled)
++		cancel_delayed_work_sync(&usbc_poll_work);
++
++	if (hpd_wq) {
++		cancel_work_sync(&hpd_connect_work);
++		cancel_work_sync(&hpd_disconnect_work);
++		destroy_workqueue(hpd_wq);
++		hpd_wq = NULL;
++	}
++
++	debugfs_remove_recursive(usbc_debugfs_dir);
++	ps5_usbc_unregister_hpd_callback();
++	pr_info("[USBC] PS5 USB-C DP alt mode driver removed\n");
++}
++
++/* The spcie driver is a PCI driver that probes asynchronously.
++ * Use a delayed workqueue to retry until spcie is ready.
++ */
++late_initcall(ps5_usbc_init);
++module_exit(ps5_usbc_exit);
++
++MODULE_AUTHOR("PS5 Linux Community");
++MODULE_DESCRIPTION("PS5 USB-C DisplayPort alt mode driver");
++MODULE_LICENSE("GPL");
 diff --git a/drivers/ps5/vmenter.S b/drivers/ps5/vmenter.S
 new file mode 100644
 index 000000000..f5348c0d7
@@ -9493,63 +11559,6 @@ index 000000000..90d41d3dc
 +void salina_start_xhci_poller(struct xhci_hcd *xhci);
 +void salina_stop_xhci_poller(void);
 \ No newline at end of file
-diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index e47e644b2..774c4955b 100644
---- a/drivers/usb/host/xhci-ring.c
-+++ b/drivers/usb/host/xhci-ring.c
-@@ -59,6 +59,8 @@
- #include <linux/dma-mapping.h>
- #include "xhci.h"
- #include "xhci-trace.h"
-+#include "xhci-ring.h"
-+#include "xhci-ps5.h"
- 
- static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
- 			 u32 field1, u32 field2,
-@@ -3083,12 +3085,14 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
-  * Handle all OS-owned events on an interrupter event ring. It may drop
-  * and reaquire xhci->lock between event processing.
-  */
--static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
-+int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
- 			      bool skip_events)
- {
- 	int event_loop = 0;
- 	int err = 0;
- 	u64 temp;
-+	int iters = 0;
-+	const int max_iters = 32;
- 
- 	xhci_clear_interrupt_pending(ir);
- 
-@@ -3131,11 +3135,27 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
- 
- 		if (err)
- 			break;
-+
-+		if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+			if (++iters > max_iters) {
-+	            xhci_warn(xhci,
-+	                  "Salina: event ring appears stuck after %d TRBs\n",
-+	                  iters);
-+	            goto salina_stuck;
-+	        }
-+		}
- 	}
- 
- 	xhci_update_erst_dequeue(xhci, ir, true);
- 
- 	return 0;
-+
-+salina_stuck:
-+    /* mark host dying so we don't deadlock future URBs */
-+    xhci->xhc_state |= XHCI_STATE_DYING;
-+
-+    xhci_update_erst_dequeue(xhci, ir, true);
-+    return -EIO;
- }
- 
- /*
 diff --git a/drivers/usb/host/xhci-ring.h b/drivers/usb/host/xhci-ring.h
 new file mode 100755
 index 000000000..193ac03a3
@@ -9620,1870 +11629,12 @@ index c8700e6a6..7d0afd378 100644
  extern const struct dmi_device * dmi_find_device(int type, const char *name,
  	const struct dmi_device *from);
  extern void dmi_setup(void);
-diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
-index 572b1c620..77052a211 100644
---- a/include/net/bluetooth/hci.h
-+++ b/include/net/bluetooth/hci.h
-@@ -309,6 +309,14 @@ enum {
- 	 */
- 	HCI_QUIRK_BROKEN_SET_RPA_TIMEOUT,
- 
-+	/* When this quirk is set, the HCI_OP_LE_SET_DEFAULT_PHY command is
-+	 * skipped during initialization. This is required for controllers
-+	 * which advertise the command but reject the default 1M PHY request.
-+	 *
-+	 * This quirk can be set before hci_register_dev is called.
-+	 */
-+	HCI_QUIRK_BROKEN_SET_DEFAULT_PHY,
-+
- 	/*
- 	 * When this quirk is set, the HCI_OP_LE_EXT_CREATE_CONN command is
- 	 * disabled. This is required for the Actions Semiconductor ATS2851
-diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
-index df23245d6..ee17cedeb 100644
---- a/net/bluetooth/hci_sync.c
-+++ b/net/bluetooth/hci_sync.c
-@@ -4874,6 +4874,12 @@ static int hci_le_set_default_phy_sync(struct hci_dev *hdev)
- {
- 	struct hci_cp_le_set_default_phy cp;
- 
-+	if (hci_test_quirk(hdev, HCI_QUIRK_BROKEN_SET_DEFAULT_PHY)) {
-+		hdev->le_tx_def_phys = HCI_LE_SET_PHY_1M;
-+		hdev->le_rx_def_phys = HCI_LE_SET_PHY_1M;
-+		return 0;
-+	}
-+
- 	if (!(hdev->commands[35] & 0x20)) {
- 		/* If the command is not supported it means only 1M PHY is
- 		 * supported.
-diff --git a/scripts/setlocalversion b/scripts/setlocalversion
-index 28169d7e1..44f516daa 100755
---- a/scripts/setlocalversion
-+++ b/scripts/setlocalversion
-@@ -61,6 +61,9 @@ scm_version()
- 	local no_dirty=false
- 	local tag
- 
-+	# Do not add any suffix for ps5-linux.
-+	return
-+
- 	while [ $# -gt 0 ];
- 	do
- 		case "$1" in
-diff --git a/sound/hda/controllers/intel.c b/sound/hda/controllers/intel.c
-index 4b03c64e7..4cb7d285c 100644
---- a/sound/hda/controllers/intel.c
-+++ b/sound/hda/controllers/intel.c
-@@ -2643,6 +2643,8 @@ static const struct pci_device_id azx_ids[] = {
- 	  AZX_DCAPS_PM_RUNTIME },
- 	{ PCI_VDEVICE(ATI, 0x1308),
- 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
-+	{ PCI_VDEVICE(ATI, 0x13ea),
-+	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
- 	{ PCI_VDEVICE(ATI, 0x157a),
- 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
- 	{ PCI_VDEVICE(ATI, 0x15b3),
-
-diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index f8c13bad4..378b6ede7 100644
---- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-@@ -80,6 +80,10 @@
- #include <linux/component.h>
- #include <linux/sort.h>
- 
-+#ifdef CONFIG_X86_PS5
-+#include <linux/ps5.h>
-+#endif
-+
- #include <drm/drm_privacy_screen_consumer.h>
- #include <drm/display/drm_dp_mst_helper.h>
- #include <drm/display/drm_hdmi_helper.h>
-@@ -3093,7 +3097,10 @@ static int dm_hw_init(struct amdgpu_ip_block *ip_block)
- 	r = amdgpu_dm_init(adev);
- 	if (r)
- 		return r;
-+#ifndef CONFIG_X86_PS5
-+	/* HPD is not supported. */
- 	amdgpu_dm_hpd_init(adev);
-+#endif
- 
- 	r = dm_oem_i2c_hw_init(adev);
- 	if (r)
-@@ -3114,7 +3121,10 @@ static int dm_hw_fini(struct amdgpu_ip_block *ip_block)
- {
- 	struct amdgpu_device *adev = ip_block->adev;
- 
-+#ifndef CONFIG_X86_PS5
-+	/* HPD is not supported. */
- 	amdgpu_dm_hpd_fini(adev);
-+#endif
- 
- 	amdgpu_dm_irq_fini(adev);
- 	amdgpu_dm_fini(adev);
-@@ -3370,6 +3380,9 @@ static void emulated_link_detect(struct dc_link *link)
- 	struct dc_sink *sink = NULL;
- 	struct dc_sink *prev_sink = NULL;
- 
-+	drm_info(dev, "[PS5] emulated_link_detect: connector_signal=%d link_type=%d\n",
-+		 link->connector_signal, link->type);
-+
- 	link->type = dc_connection_none;
- 	prev_sink = link->local_sink;
- 
-@@ -3421,6 +3434,24 @@ static void emulated_link_detect(struct dc_link *link)
- 		return;
- 	}
- 
-+	/* Update DDC transaction type and aux_mode so EDID read
-+	 * uses the correct AUX engine (DDC2 for USB-C).
-+	 */
-+	set_ddc_transaction_type(link->ddc, sink_caps.transaction_type);
-+	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
-+	drm_info(dev, "[PS5] emulated_link_detect: aux_mode=%d transaction_type=%d\n",
-+		link->aux_mode, sink_caps.transaction_type);
-+
-+	/* PS5: Acquire combo PHY before EDID read for USB-C DP.
-+	 * The combo PHY needs to be in DP alt mode with ref clock enabled
-+	 * for AUX transactions to work. Normally this happens during
-+	 * enable_dp_output, but emulated detect reads EDID before that.
-+	 */
-+	if (link->link_enc && link->link_enc->funcs->acquire_phy) {
-+		bool acquired = link->link_enc->funcs->acquire_phy(link->link_enc);
-+		drm_info(dev, "[PS5] emulated_link_detect: acquire_phy=%d\n", acquired);
-+	}
-+
- 	sink_init_data.link = link;
- 	sink_init_data.sink_signal = sink_caps.signal;
- 
-@@ -3438,6 +3469,8 @@ static void emulated_link_detect(struct dc_link *link)
- 			link,
- 			sink);
- 
-+	drm_info(dev, "[PS5] emulated_link_detect: EDID status=%d\n", edid_status);
-+
- 	if (edid_status != EDID_OK)
- 		drm_err(dev, "Failed to read EDID\n");
- 
-@@ -4222,8 +4255,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
- 	bool ret = false;
- 	bool debounce_required = false;
- 
--	if (adev->dm.disable_hpd_irq)
-+	if (adev->dm.disable_hpd_irq) {
-+		drm_info(dev, "[PS5] handle_hpd_irq_helper: disable_hpd_irq set, returning\n");
- 		return;
-+	}
-+
-+	drm_info(dev, "[PS5] handle_hpd_irq_helper: connector=%s force=%d\n",
-+		 connector->name, connector->force);
- 
- 	/*
- 	 * In case of failure or MST no need to update connector status or notify the OS
-@@ -4243,6 +4281,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
- 	if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
- 		drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
- 
-+	drm_info(adev_to_drm(adev), "[PS5] connection_type=%d force=%d\n",
-+		 new_connection_type, aconnector->base.force);
-+
- 	/*
- 	 * Check for HDMI disconnect with debounce enabled.
- 	 */
-@@ -4315,6 +4356,81 @@ static void handle_hpd_irq(void *param)
- 
- }
- 
-+#ifdef CONFIG_X86_PS5
-+/* PS5: USBC DP alt mode HPD callback.
-+ * Called by the PS5 USBC driver when a USB-C DP connection state changes.
-+ * We find the USB-C connector and forward the HPD event to the standard
-+ * amdgpu DM HPD handler.
-+ */
-+static struct amdgpu_device *ps5_usbc_hpd_adev;
-+static struct amdgpu_dm_connector *ps5_usbc_find_aconnector(struct amdgpu_device *adev)
-+{
-+	struct drm_device *dev = adev_to_drm(adev);
-+	struct drm_connector *connector;
-+	struct amdgpu_dm_connector *aconnector;
-+
-+	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
-+		aconnector = to_amdgpu_dm_connector(connector);
-+		if (aconnector->dc_link) {
-+			drm_info(dev, "[PS5] connector %s: link_id.id=%d enum_id=%d\n",
-+				 connector->name,
-+				 aconnector->dc_link->link_id.id,
-+				 aconnector->dc_link->link_id.enum_id);
-+			/* PS5 VBIOS reports both HDMI and USB-C as
-+			 * CONNECTOR_ID_DISPLAY_PORT. The USB-C connector
-+			 * is enum_id=2 (HDMI is enum_id=1). */
-+			if (aconnector->dc_link->link_id.enum_id == ENUM_ID_2 &&
-+			    aconnector->dc_link->link_id.id == CONNECTOR_ID_DISPLAY_PORT)
-+				return aconnector;
-+		}
-+	}
-+	return NULL;
-+}
-+
-+static void ps5_usbc_hpd_callback(enum ps5_usbc_hpd_event event, void *data)
-+{
-+	struct amdgpu_device *adev = ps5_usbc_hpd_adev;
-+	struct amdgpu_dm_connector *aconnector;
-+
-+	if (!adev)
-+		return;
-+
-+	aconnector = ps5_usbc_find_aconnector(adev);
-+	if (!aconnector) {
-+		drm_warn(adev_to_drm(adev), "[PS5] USBC HPD: no USB-C connector found\n");
-+		return;
-+	}
-+
-+	drm_info(adev_to_drm(adev), "[PS5] USBC HPD event %d for connector %s\n",
-+		 event, aconnector->base.name);
-+
-+	/* For USB-C DP alt mode, the normal dc_link_detect may fail to
-+	 * detect the display via AUX if the PD controller hasn't fully
-+	 * configured the DP path. Use force=ON to trigger the emulated
-+	 * link detect path which creates a virtual sink and reads EDID.
-+	 */
-+	if (event == PS5_USBC_HPD_CONNECT) {
-+		aconnector->base.force = DRM_FORCE_ON;
-+		drm_info(adev_to_drm(adev), "[PS5] USBC: forcing connector ON for emulated detect\n");
-+	} else if (event == PS5_USBC_HPD_DISCONNECT) {
-+		aconnector->base.force = DRM_FORCE_UNSPECIFIED;
-+		drm_info(adev_to_drm(adev), "[PS5] USBC: clearing force for disconnect\n");
-+	}
-+
-+	switch (event) {
-+	case PS5_USBC_HPD_CONNECT:
-+	case PS5_USBC_HPD_IRQ:
-+		handle_hpd_irq_helper(aconnector);
-+		break;
-+	case PS5_USBC_HPD_DISCONNECT:
-+		handle_hpd_irq_helper(aconnector);
-+		break;
-+	default:
-+		break;
-+	}
-+}
-+#endif
-+
- static void schedule_hpd_rx_offload_work(struct amdgpu_device *adev, struct hpd_rx_irq_offload_work_queue *offload_wq,
- 							union hpd_irq_data hpd_irq_data)
- {
-@@ -4479,6 +4595,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
- 	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
- 	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
- 
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: Register USBC HPD callback for USB-C DP alt mode hotplug */
-+	ps5_usbc_hpd_adev = adev;
-+	ps5_usbc_register_hpd_callback(ps5_usbc_hpd_callback, NULL);
-+	drm_info(adev_to_drm(adev), "[PS5] Registered USBC HPD callback\n");
-+#endif
-+
- 	if (dc_is_dmub_outbox_supported(adev->dm.dc)) {
- 		if (!register_dmub_notify_callback(adev, DMUB_NOTIFICATION_HPD,
- 			dmub_hpd_callback, true)) {
-@@ -6880,6 +7003,12 @@ static void fill_stream_properties_from_drm_display_mode(
- 
- 	stream->output_color_space = get_output_color_space(timing_out, connector_state);
- 	stream->content_type = get_output_content_type(connector_state);
-+
-+#ifdef CONFIG_X86_PS5
-+	/* Hardcode RGB888. */
-+	// timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
-+	// timing_out->display_color_depth = COLOR_DEPTH_888;
-+#endif
- }
- 
- static void fill_audio_info(struct audio_info *audio_info,
-@@ -8269,6 +8398,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
- 	 */
- 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
- 
-+#ifdef CONFIG_X86_PS5
-+	if (!isHdmiModeValid(mode, amdgpu_force_1080p))
-+		return MODE_ERROR;
-+#endif
-+
- 	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
- 			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
- 		return result;
-@@ -10957,12 +11091,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
- 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
- 	drm_dp_mst_atomic_wait_for_dependencies(state);
- 
-+#ifdef CONFIG_X86_PS5
-+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
-+				      new_crtc_state, i) {
-+		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
-+		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
-+
-+		if ((new_crtc_state->active &&
-+		    (!old_crtc_state->active ||
-+		     drm_atomic_crtc_needs_modeset(new_crtc_state))) ||
-+		    (old_crtc_state->active &&
-+		    (!new_crtc_state->active ||
-+		     drm_atomic_crtc_needs_modeset(new_crtc_state)))) {
-+			if (dm_new_crtc_state->stream && dc_is_dp_signal(dm_new_crtc_state->stream->signal)) {
-+				/* Call HDMI-specific functions for the HDMI
-+				 * connector (which uses DP signal internally
-+				 * via the FLAVA3 HDMI IC), but not for USB-C DP.
-+				 * PS5 VBIOS reports both as CONNECTOR_ID_DISPLAY_PORT;
-+				 * USB-C is enum_id=2.
-+				 */
-+				if (dm_new_crtc_state->stream->link->link_id.enum_id != ENUM_ID_2) {
-+					sceHdmiSetAudioMute(1);
-+					sceHdmiDeviceSetVideoMute(1);
-+					sceHdmiInitVideoConfig();
-+				}
-+			}
-+		}
-+	}
-+#endif
-+
- 	dm_state = dm_atomic_get_new_state(state);
- 	if (dm_state && dm_state->context) {
- 		dc_state = dm_state->context;
- 		amdgpu_dm_commit_streams(state, dc_state);
- 	}
- 
-+#ifdef CONFIG_X86_PS5
-+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
-+				      new_crtc_state, i) {
-+		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
-+		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
-+
-+		if (new_crtc_state->active &&
-+		    (!old_crtc_state->active ||
-+		     drm_atomic_crtc_needs_modeset(new_crtc_state))) {
-+			if (dm_new_crtc_state->stream && dc_is_dp_signal(dm_new_crtc_state->stream->signal)) {
-+				struct dc_stream_state *stream = dm_new_crtc_state->stream;
-+				int channels = 0, j;
-+
-+				/* Call HDMI-specific functions for the HDMI
-+				 * connector (which uses DP signal internally
-+				 * via the FLAVA3 HDMI IC). USB-C DP uses the
-+				 * standard DC pipeline for video/audio.
-+				 * PS5 VBIOS reports both as CONNECTOR_ID_DISPLAY_PORT;
-+				 * USB-C is enum_id=2.
-+				 */
-+				if (stream->link->link_id.enum_id == ENUM_ID_2)
-+					continue;
-+
-+				for (j = 0; j < stream->audio_info.mode_count; j++) {
-+					if (stream->audio_info.modes[j].channel_count > channels)
-+						channels = stream->audio_info.modes[j].channel_count;
-+				}
-+
-+				/* Fallback to stereo if EDID has no audio modes */
-+				if (channels == 0)
-+					channels = 2;
-+
-+				sceHdmiSetVideoConfig(&new_crtc_state->mode);
-+				sceHdmiDeviceSetVideoMute(0);
-+				sceHdmiSetAudioConfig(channels);
-+				sceHdmiSetAudioMute(0);
-+			}
-+		}
-+	}
-+#endif
-+
- 	amdgpu_dm_update_hdcp(state);
- 
- 	/* Handle connector state changes */
-
-diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..9ce2b3cb6 100644
---- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-@@ -1097,6 +1097,11 @@ enum dc_edid_status dm_helpers_read_local_edid(
- 	else
- 		ddc = &aconnector->i2c->base;
- 
-+#ifdef CONFIG_X86_PS5
-+	drm_info(connector->dev, "[PS5] dm_helpers_read_local_edid: aux_mode=%d ddc=%p connector=%s\n",
-+		link->aux_mode, ddc, connector->name);
-+#endif
-+
- 	if (link->dc->hwss.prepare_ddc)
- 		link->dc->hwss.prepare_ddc(link);
- 
-
-diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
-index 0e1f97332..a75f4b9e9 100644
---- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
-+++ b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
-@@ -44,6 +44,18 @@
- 
- #include "bios_parser_common.h"
- 
-+#ifdef CONFIG_X86_PS5
-+#include <linux/printk.h>
-+#include <linux/ps5.h>
-+/* PS5: The VBIOS may only define the HDMI connector (UNIPHY_A).
-+ * We inject a second connector (USB-C DP alt mode, UNIPHY_B) so
-+ * the DC core creates a link for the USB-C DP port.
-+ */
-+static bool ps5_usbc_connector_injected;
-+static struct graphics_object_id ps5_usbc_connector_id;
-+static struct graphics_object_id ps5_usbc_encoder_id;
-+#endif
-+
- #define DC_LOGGER \
- 	bp->base.ctx->logger
- 
-@@ -157,6 +169,16 @@ static uint8_t bios_parser_get_connectors_number(struct dc_bios *dcb)
- 
- 		break;
- 	}
-+
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: Ensure at least 2 connectors (HDMI + USB-C DP).
-+	 * If the VBIOS only defines 1 (HDMI), we inject a USB-C connector.
-+	 */
-+	if (count < 2) {
-+		pr_info("[PS5] VBIOS has %u connector(s), injecting USB-C DP connector\n", count);
-+		count = 2;
-+	}
-+#endif
- 	return count;
- }
- 
-@@ -198,6 +220,22 @@ static struct graphics_object_id bios_parser_get_connector_id(
- 		}
- 		break;
- 	}
-+
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: If the VBIOS doesn't define a connector for this index,
-+	 * inject a USB-C DP connector (CONNECTOR_ID_USBC, ENUM_ID_1)
-+	 * mapped to UNIPHY_B (ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2).
-+	 */
-+	if (object_id.id == 0 || object_id.type == OBJECT_TYPE_UNKNOWN) {
-+		object_id = dal_graphics_object_id_init(
-+			CONNECTOR_ID_USBC, ENUM_ID_1, OBJECT_TYPE_CONNECTOR);
-+		ps5_usbc_connector_id = object_id;
-+		ps5_usbc_encoder_id = dal_graphics_object_id_init(
-+			ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2, OBJECT_TYPE_ENCODER);
-+		ps5_usbc_connector_injected = true;
-+		pr_info("[PS5] Injected USB-C DP connector for index %u\n", i);
-+	}
-+#endif
- 	return object_id;
- }
- 
-@@ -260,6 +298,19 @@ static enum bp_result bios_parser_get_src_obj(struct dc_bios *dcb,
- 		}
- 		break;
- 	case OBJECT_TYPE_CONNECTOR:
-+#ifdef CONFIG_X86_PS5
-+		/* PS5: For the injected USB-C connector, return the hardcoded
-+		 * UNIPHY_B encoder (ENCODER_ID_INTERNAL_UNIPHY, ENUM_ID_2).
-+		 */
-+		if (ps5_usbc_connector_injected &&
-+		    object_id.type == ps5_usbc_connector_id.type &&
-+		    object_id.id == ps5_usbc_connector_id.id &&
-+		    object_id.enum_id == ps5_usbc_connector_id.enum_id) {
-+			*src_object_id = ps5_usbc_encoder_id;
-+			pr_info("[PS5] Returning injected UNIPHY_B encoder for USB-C connector\n");
-+			return BP_RESULT_OK;
-+		}
-+#endif
- 		switch (bp->object_info_tbl.revision.minor) {
- 		default:
- 		case 4:
-@@ -578,6 +629,23 @@ static enum bp_result bios_parser_get_hpd_info(
- 	if (!info)
- 		return BP_RESULT_BADINPUT;
- 
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: For the injected USB-C connector, return HPD2 info.
-+	 * UNIPHY_A (HDMI) uses HPD1, UNIPHY_B (USB-C DP) uses HPD2.
-+	 * Note: HPD for USB-C is actually handled via ICC notifications,
-+	 * not GPIO interrupts. This just prevents the ASSERT in construct_phy.
-+	 */
-+	if (ps5_usbc_connector_injected &&
-+	    id.type == ps5_usbc_connector_id.type &&
-+	    id.id == ps5_usbc_connector_id.id &&
-+	    id.enum_id == ps5_usbc_connector_id.enum_id) {
-+		info->hpd_int_gpio_uid = 2; /* HPD2 */
-+		info->hpd_active = 0;
-+		pr_info("[PS5] Returning HPD2 info for USB-C connector\n");
-+		return BP_RESULT_OK;
-+	}
-+#endif
-+
- 	switch (bp->object_info_tbl.revision.minor) {
- 	case 4:
- 	default:
-@@ -790,6 +858,20 @@ static enum bp_result bios_parser_get_device_tag(
- 	if (!info)
- 		return BP_RESULT_BADINPUT;
- 
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: For the injected USB-C connector, return a DP device tag. */
-+	if (ps5_usbc_connector_injected &&
-+	    connector_object_id.type == ps5_usbc_connector_id.type &&
-+	    connector_object_id.id == ps5_usbc_connector_id.id &&
-+	    connector_object_id.enum_id == ps5_usbc_connector_id.enum_id) {
-+		info->acpi_device = 0;
-+		info->dev_id.device_type = DEVICE_TYPE_DFP;
-+		info->dev_id.enum_id = 2;
-+		pr_info("[PS5] Returning DP device tag for USB-C connector\n");
-+		return BP_RESULT_OK;
-+	}
-+#endif
-+
- 	switch (bp->object_info_tbl.revision.minor) {
- 	case 4:
- 	default:
-
-diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
-index 673bb87d2..c7144160d 100644
---- a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
-+++ b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
-@@ -575,8 +575,16 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
- 	}
- 
- 	aux_engine = ddc->ctx->dc->res_pool->engines[ddc_pin->pin_data->en];
-+#ifdef CONFIG_X86_PS5
-+	pr_info("PS5: dce_aux_transfer_raw: en=%d addr=0x%04x len=%u write=%d aux_engine=%p",
-+		ddc_pin->pin_data->en, payload->address, payload->length,
-+		payload->write, aux_engine);
-+#endif
- 	if (!acquire(aux_engine, ddc_pin)) {
- 		*operation_result = AUX_RET_ERROR_ENGINE_ACQUIRE;
-+#ifdef CONFIG_X86_PS5
-+		pr_info("PS5: dce_aux_transfer_raw: FAILED to acquire aux engine");
-+#endif
- 		return -1;
- 	}
- 
-@@ -595,6 +603,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
- 	submit_channel_request(aux_engine, &aux_req);
- 	*operation_result = get_channel_status(aux_engine, &returned_bytes);
- 
-+#ifdef CONFIG_X86_PS5
-+	pr_info("PS5: dce_aux_transfer_raw: operation_result=%d returned_bytes=%u",
-+		*operation_result, returned_bytes);
-+#endif
-+
- 	if (*operation_result == AUX_RET_SUCCESS) {
- 		int __maybe_unused bytes_replied = 0;
- 
-
-diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
-index 9459e8f28..19aaf042a 100644
---- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
-+++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c
-@@ -33,6 +33,11 @@
- 
- #include "gpio_service_interface.h"
- 
-+#ifdef CONFIG_X86_PS5
-+#include <linux/delay.h>
-+#include <linux/printk.h>
-+#endif
-+
- #define CTX \
- 	enc10->base.ctx
- 
-@@ -56,7 +61,7 @@ static void dcn201_link_encoder_get_max_link_cap(struct link_encoder *enc,
- 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
- 
- 	dcn10_link_encoder_get_max_link_cap(enc, link_settings);
--	REG_GET_2(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value1,
-+	REG_GET_2(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value1,
- 		 RDPCS_PHY_DPALT_DP4, &value2);
- 	/*limit to combo_phy*/
- 	if (enc->usbc_combo_phy) {
-@@ -70,12 +75,248 @@ static bool dcn201_link_encoder_is_in_alt_mode(struct link_encoder *enc)
- 	uint32_t value;
- 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
- 
--	REG_GET(RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, &value);
-+	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
- 
- 	// if value == 1 alt mode is disabled, otherwise it is enabled
- 	return !value;
- }
- 
-+#ifdef CONFIG_X86_PS5
-+/* PS5: Acquire combo PHY for USB-C DP alt mode.
-+ * On PS5, the USB-C port is PSVR2-only and the firmware may not
-+ * configure the combo PHY for DP alt mode. This function:
-+ * 1. Checks if DP alt mode is enabled (RDPCS_PHY_DPALT_DISABLE == 0)
-+ * 2. If not, tries to enable it by clearing DPALT_DISABLE
-+ * 3. Acknowledges alt mode (DPALT_DISABLE_ACK = 0)
-+ * 4. Enables DP reference clock (DP_REF_CLK_EN = 1)
-+ * Based on dcn21_link_encoder_acquire_phy. DPALT bits and REF_CLK_EN
-+ * are all in PHY_CNTL6 on DCN201 (same as DCN20/DCN21).
-+ */
-+static bool dcn201_link_encoder_acquire_phy(struct link_encoder *enc)
-+{
-+	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
-+	uint32_t value, cntl2, cntl5, cntl6, cntl11;
-+
-+	if (!enc->features.flags.bits.DP_IS_USB_C) {
-+		/* Non-USB-C (HDMI): dump registers for comparison, then enable ref clock */
-+		uint32_t h0, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14;
-+		h0 = REG_READ(RDPCSTX_PHY_CNTL0);
-+		h2 = REG_READ(RDPCSTX_PHY_CNTL2);
-+		h3 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL3);
-+		h4 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL4);
-+		h5 = REG_READ(RDPCSTX_PHY_CNTL5);
-+		h6 = REG_READ(RDPCSTX_PHY_CNTL6);
-+		h7 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL7);
-+		h8 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL8);
-+		h9 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL9);
-+		h10 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL10);
-+		h11 = REG_READ(RDPCSTX_PHY_CNTL11);
-+		h12 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL12);
-+		h13 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL13);
-+		h14 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL14);
-+		pr_info("PS5:  HDMI PHY CNTL0=0x%08x CNTL2=0x%08x CNTL3=0x%08x CNTL4=0x%08x",
-+			h0, h2, h3, h4);
-+		pr_info("PS5:  HDMI PHY CNTL5=0x%08x CNTL6=0x%08x CNTL7=0x%08x CNTL8=0x%08x",
-+			h5, h6, h7, h8);
-+		pr_info("PS5:  HDMI PHY CNTL9=0x%08x CNTL10=0x%08x CNTL11=0x%08x CNTL12=0x%08x",
-+			h9, h10, h11, h12);
-+		pr_info("PS5:  HDMI PHY CNTL13=0x%08x CNTL14=0x%08x",
-+			h13, h14);
-+		REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
-+		return true;
-+	}
-+
-+	/* USB-C combo PHY: dump register state for debugging */
-+	cntl2 = REG_READ(RDPCSTX_PHY_CNTL2);
-+	cntl5 = REG_READ(RDPCSTX_PHY_CNTL5);
-+	cntl6 = REG_READ(RDPCSTX_PHY_CNTL6);
-+	cntl11 = REG_READ(RDPCSTX_PHY_CNTL11);
-+	pr_info("PS5:  Combo PHY regs: CNTL2=0x%08x CNTL5=0x%08x CNTL6=0x%08x CNTL11=0x%08x",
-+		cntl2, cntl5, cntl6, cntl11);
-+	{
-+		uint32_t cntl0;
-+		cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
-+		pr_info("PS5:  Combo PHY power: CNTL0=0x%08x", cntl0);
-+
-+		/* PS5 firmware leaves USB-C combo PHY in reset + HDMI mode.
-+		 * Switch to DP mode and take PHY out of reset so AUX signals
-+		 * can pass through to the USB-C display.
-+		 *
-+		 * RDPCS_PHY_HDMIMODE_ENABLE (bit 8): 1=HDMI, 0=DP
-+		 * RDPCS_PHY_RESET (bit 0): 1=reset, 0=active
-+		 */
-+		if (cntl0 & (1 << 8)) {
-+			pr_info("PS5:  PHY in HDMI mode, switching to DP mode");
-+			/* Use dm_write_reg directly — REG_UPDATE may not stick */
-+			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
-+				     cntl0 & ~(1 << 8));
-+			udelay(100);
-+			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
-+			pr_info("PS5:  After HDMI->DP: CNTL0=0x%08x", cntl0);
-+		}
-+		if (cntl0 & 0x1) {
-+			pr_info("PS5:  PHY in reset, taking out of reset");
-+			dm_write_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL0,
-+				     cntl0 & ~0x1);
-+			udelay(1000);
-+			cntl0 = REG_READ(RDPCSTX_PHY_CNTL0);
-+			pr_info("PS5:  After reset release: CNTL0=0x%08x", cntl0);
-+		}
-+	}
-+
-+	/* Also dump AUX_CONTROL register */
-+	{
-+		uint32_t aux_ctrl, aux_rx0, aux_tx;
-+		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
-+		aux_rx0 = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_RX_CONTROL0);
-+		aux_tx = dm_read_reg(CTX, enc10->aux_regs->AUX_DPHY_TX_CONTROL);
-+		pr_info("PS5:  AUX_CONTROL=0x%08x AUX_DPHY_RX_CONTROL0=0x%08x AUX_DPHY_TX_CONTROL=0x%08x",
-+			aux_ctrl, aux_rx0, aux_tx);
-+
-+		/* Fix AUX_HPD_SEL: USB-C uses HPD2 (source=2), but VBIOS may
-+		 * have set HPD1 (source=1). AUX_HPD_SEL is bits 20:21.
-+		 * Wrong HPD source causes AUX_RET_ERROR_HPD_DISCON.
-+		 */
-+		uint32_t hpd_sel = (aux_ctrl >> 20) & 3;
-+		if (hpd_sel != 2) {
-+			pr_info("PS5:  Fixing AUX_HPD_SEL: %d -> 2 (HPD2 for USB-C)", hpd_sel);
-+			aux_ctrl = (aux_ctrl & ~(3 << 20)) | (2 << 20);
-+		}
-+
-+		/* Set AUX_IGNORE_HPD_DISCON (bit 16) — PS5 USB-C HPD is
-+		 * virtual (via ICC PD controller), not a physical HPD pin.
-+		 * The AUX engine checks HPD before transactions and rejects
-+		 * them with HPD_DISCON if HPD is low. Since the USB-C display
-+		 * doesn't assert a physical HPD line, we must bypass this check.
-+		 */
-+		aux_ctrl |= (1 << 16);
-+
-+		/* Enable AUX engine if not already enabled (AUX_EN = bit 0) */
-+		if (!(aux_ctrl & 0x1)) {
-+			pr_info("PS5:  AUX engine not enabled, enabling now");
-+			aux_ctrl |= 0x1;
-+		}
-+
-+		/* Write updated AUX_CONTROL */
-+		dm_write_reg(CTX, enc10->aux_regs->AUX_CONTROL, aux_ctrl);
-+		udelay(100);
-+		/* Read back to verify */
-+		aux_ctrl = dm_read_reg(CTX, enc10->aux_regs->AUX_CONTROL);
-+		pr_info("PS5:  After AUX fix: AUX_CONTROL=0x%08x (AUX_EN=%d HPD_SEL=%d)",
-+			aux_ctrl, aux_ctrl & 0x1, (aux_ctrl >> 20) & 3);
-+	}
-+
-+	/* Check DP alt mode status */
-+	REG_GET(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, &value);
-+	pr_info("PS5:  Combo PHY DPALT_DISABLE = %d", value);
-+
-+	if (value == 1) {
-+		/* DP alt mode is disabled. The combo PHY has not been
-+		 * configured for DP alt mode (expected on PS5 since the
-+		 * USB-C port is PSVR2-only and firmware doesn't init it).
-+		 * Try to enable it by clearing DPALT_DISABLE.
-+		 */
-+		pr_info("PS5:  Enabling DP alt mode on combo PHY");
-+		REG_UPDATE(RDPCSTX_PHY_CNTL6,
-+				RDPCS_PHY_DPALT_DISABLE, 0);
-+		udelay(100);
-+
-+		REG_GET(RDPCSTX_PHY_CNTL6,
-+				RDPCS_PHY_DPALT_DISABLE, &value);
-+		pr_info("PS5:  After enable, DPALT_DISABLE = %d", value);
-+		if (value == 1) {
-+			pr_info("PS5:  Failed to enable DP alt mode (hardware refused)\n");
-+			return false;
-+		}
-+	}
-+
-+	/* Acknowledge DP alt mode */
-+	REG_UPDATE(RDPCSTX_PHY_CNTL6,
-+			RDPCS_PHY_DPALT_DISABLE_ACK, 0);
-+	udelay(40);
-+
-+	/* Verify alt mode is still active */
-+	REG_GET(RDPCSTX_PHY_CNTL6,
-+			RDPCS_PHY_DPALT_DISABLE, &value);
-+	if (value == 1) {
-+		pr_info("PS5:  DP alt mode disabled after ACK\n");
-+		REG_UPDATE(RDPCSTX_PHY_CNTL6,
-+				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
-+		return false;
-+	}
-+
-+	pr_info("PS5:  Combo PHY acquired for DP alt mode");
-+
-+	/* Dump all PHY CNTL registers for debugging */
-+	{
-+		uint32_t c0, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14;
-+		c0 = REG_READ(RDPCSTX_PHY_CNTL0);
-+		c2 = REG_READ(RDPCSTX_PHY_CNTL2);
-+		c3 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL3);
-+		c4 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL4);
-+		c5 = REG_READ(RDPCSTX_PHY_CNTL5);
-+		c6 = REG_READ(RDPCSTX_PHY_CNTL6);
-+		c7 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL7);
-+		c8 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL8);
-+		c9 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL9);
-+		c10 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL10);
-+		c11 = REG_READ(RDPCSTX_PHY_CNTL11);
-+		c12 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL12);
-+		c13 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL13);
-+		c14 = dm_read_reg(CTX, enc10->link_regs->RDPCSTX_PHY_CNTL14);
-+		pr_info("PS5:  PHY CNTL0=0x%08x CNTL2=0x%08x CNTL3=0x%08x CNTL4=0x%08x",
-+			c0, c2, c3, c4);
-+		pr_info("PS5:  PHY CNTL5=0x%08x CNTL6=0x%08x CNTL7=0x%08x CNTL8=0x%08x",
-+			c5, c6, c7, c8);
-+		pr_info("PS5:  PHY CNTL9=0x%08x CNTL10=0x%08x CNTL11=0x%08x CNTL12=0x%08x",
-+			c9, c10, c11, c12);
-+		pr_info("PS5:  PHY CNTL13=0x%08x CNTL14=0x%08x",
-+			c13, c14);
-+	}
-+
-+	/* Enable DP reference clock for USB-C combo PHY */
-+	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 1);
-+
-+	return true;
-+}
-+
-+static void dcn201_link_encoder_release_phy(struct link_encoder *enc)
-+{
-+	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
-+
-+	if (enc->features.flags.bits.DP_IS_USB_C) {
-+		REG_UPDATE(RDPCSTX_PHY_CNTL6,
-+				RDPCS_PHY_DPALT_DISABLE_ACK, 1);
-+	}
-+
-+	REG_UPDATE(RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, 0);
-+}
-+
-+static void dcn201_link_encoder_enable_dp_output(
-+	struct link_encoder *enc,
-+	const struct dc_link_settings *link_settings,
-+	enum clock_source_id clock_source)
-+{
-+	if (!dcn201_link_encoder_acquire_phy(enc)) {
-+		pr_info("PS5:  Failed to acquire PHY for USB-C DP output\n");
-+		return;
-+	}
-+
-+	dcn10_link_encoder_enable_dp_output(enc, link_settings, clock_source);
-+}
-+
-+static void dcn201_link_encoder_disable_output(
-+	struct link_encoder *enc,
-+	enum signal_type signal)
-+{
-+	dcn10_link_encoder_disable_output(enc, signal);
-+
-+	if (enc->features.flags.bits.DP_IS_USB_C &&
-+	    dc_is_dp_signal(signal))
-+		dcn201_link_encoder_release_phy(enc);
-+}
-+#endif
-+
- static const struct link_encoder_funcs dcn201_link_enc_funcs = {
- 	.read_state = link_enc2_read_state,
- 	.validate_output_with_stream =
-@@ -83,9 +324,14 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
- 	.hw_init = enc2_hw_init,
- 	.setup = dcn10_link_encoder_setup,
- 	.enable_tmds_output = dcn10_link_encoder_enable_tmds_output,
-+#ifdef CONFIG_X86_PS5
-+	.enable_dp_output = dcn201_link_encoder_enable_dp_output,
-+	.disable_output = dcn201_link_encoder_disable_output,
-+#else
- 	.enable_dp_output = dcn10_link_encoder_enable_dp_output,
--	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
- 	.disable_output = dcn10_link_encoder_disable_output,
-+#endif
-+	.enable_dp_mst_output = dcn10_link_encoder_enable_dp_mst_output,
- 	.dp_set_lane_settings = dcn10_link_encoder_dp_set_lane_settings,
- 	.dp_set_phy_pattern = dcn10_link_encoder_dp_set_phy_pattern,
- 	.update_mst_stream_allocation_table =
-@@ -98,11 +344,18 @@ static const struct link_encoder_funcs dcn201_link_enc_funcs = {
- 	.disable_hpd = dcn10_link_encoder_disable_hpd,
- 	.is_dig_enabled = dcn10_is_dig_enabled,
- 	.destroy = dcn10_link_encoder_destroy,
-+#ifndef CONFIG_X86_PS5
-+	/* Ignore this to prevent blackscreen. */
- 	.fec_set_enable = enc2_fec_set_enable,
- 	.fec_set_ready = enc2_fec_set_ready,
-+#endif
- 	.get_dig_frontend = dcn10_get_dig_frontend,
- 	.fec_is_active = enc2_fec_is_active,
- 	.is_in_alt_mode = dcn201_link_encoder_is_in_alt_mode,
-+#ifdef CONFIG_X86_PS5
-+	.acquire_phy = dcn201_link_encoder_acquire_phy,
-+	.release_phy = dcn201_link_encoder_release_phy,
-+#endif
- 	.get_max_link_cap = dcn201_link_encoder_get_max_link_cap,
- 	.get_hpd_state = dcn10_get_hpd_state,
- 	.program_hpd_filter = dcn10_program_hpd_filter,
-
-diff --git a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
-index be25e8dc0..b49448b38 100644
---- a/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
-+++ b/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h
-@@ -30,13 +30,6 @@
- 
- #define DPCS_DCN201_MASK_SH_LIST(mask_sh)\
- 	DPCS_MASK_SH_LIST(mask_sh),\
--	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD, mask_sh),\
--	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_2, VCO_LD_VAL_OVRD_EN, mask_sh),\
--	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD, mask_sh),\
--	LE_SF(DPCSSYS_CR0_RAWLANE0_DIG_PCS_XF_RX_OVRD_IN_3, REF_LD_VAL_OVRD_EN, mask_sh),\
--	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
--	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
--	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL2, RDPCS_PHY_DPALT_DP4, mask_sh),\
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_PSTATE, mask_sh),\
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX1_PSTATE, mask_sh),\
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL5, RDPCS_PHY_DP_TX0_MPLL_EN, mask_sh),\
-@@ -44,8 +37,10 @@
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_WIDTH, mask_sh),\
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX2_RATE, mask_sh),\
- 	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_WIDTH, mask_sh),\
--	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh),\
--	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL11, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
-+	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_TX3_RATE, mask_sh)
-+/* DPALT_DISABLE, DPALT_DISABLE_ACK, DPALT_DP4, DP_REF_CLK_EN
-+ * are in DPCS_MASK_SH_LIST but NOT in dpcs_2_0_3_sh_mask.h.
-+ * They are defined manually in LINK_ENCODER_MASK_SH_LIST_DCN201_PS5. */
- 
- #define DPCS_DCN201_REG_LIST(id) \
- 	DPCS_DCN2_CMN_REG_LIST(id), \
-
-diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
-index 5abbf485d..fbaac888b 100644
---- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
-+++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
-@@ -166,6 +166,9 @@ struct link_encoder_funcs {
- 	bool (*fec_is_active)(struct link_encoder *enc);
- 	bool (*is_in_alt_mode) (struct link_encoder *enc);
- 
-+	bool (*acquire_phy)(struct link_encoder *enc);
-+	void (*release_phy)(struct link_encoder *enc);
-+
- 	void (*get_max_link_cap)(struct link_encoder *enc,
- 		struct dc_link_settings *link_settings);
- 
-
-diff --git a/drivers/gpu/drm/amd/display/dc/link/link_factory.c b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
-index ae4c4ad05..118ab5c4e 100644
---- a/drivers/gpu/drm/amd/display/dc/link/link_factory.c
-+++ b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
-@@ -620,6 +620,25 @@ static bool construct_phy(struct dc_link *link,
- 		goto link_enc_create_fail;
- 	}
- 
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: Force DP_IS_USB_C flag for USB-C DP alt mode connector.
-+	 * The VBIOS reports both HDMI and USB-C as CONNECTOR_ID_DISPLAY_PORT;
-+	 * the USB-C connector is enum_id=2 (HDMI is enum_id=1).
-+	 */
-+	if (link->link_id.id == CONNECTOR_ID_DISPLAY_PORT &&
-+	    link->link_id.enum_id == ENUM_ID_2) {
-+		link->link_enc->features.flags.bits.DP_IS_USB_C = 1;
-+		link->link_enc->usbc_combo_phy = true;
-+		pr_info("PS5:  Set DP_IS_USB_C and usbc_combo_phy for USB-C connector (enum_id=2)");
-+
-+		/* Log combo PHY alt mode status at init */
-+		if (link->link_enc->funcs->is_in_alt_mode) {
-+			bool in_alt = link->link_enc->funcs->is_in_alt_mode(link->link_enc);
-+			pr_info("PS5:  Combo PHY DP alt mode at init: %s", in_alt ? "ENABLED" : "DISABLED");
-+		}
-+	}
-+#endif
-+
- 	DC_LOG_DC("BIOS object table - DP_IS_USB_C: %d", link->link_enc->features.flags.bits.DP_IS_USB_C);
- 	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
- 
-
-diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-index a66217e54..c52bc8cc0 100644
---- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-+++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-@@ -37,6 +37,11 @@
- #include "link_dpcd.h"
- #include "dm_helpers.h"
- #include "atomfirmware.h"
-+#ifdef CONFIG_X86_PS5
-+#include <linux/ps5.h>
-+#include "gpio_types.h"
-+#include "gpio_service_interface.h"
-+#endif
- 
- #define DC_LOGGER \
- 	ddc_service->ctx->logger
-@@ -122,8 +127,20 @@ static void ddc_service_construct(
- 	if (init_data->is_dpia_link ||
- 	    dcb->funcs->get_i2c_info(dcb, init_data->id, &i2c_info) != BP_RESULT_OK) {
- 		ddc_service->ddc_pin = NULL;
-+#ifdef CONFIG_X86_PS5
-+		if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
-+		    init_data->id.enum_id == ENUM_ID_2)
-+			pr_info("PS5:  VBIOS has no i2c_info for USB-C connector (enum_id=2)");
-+#endif
- 	} else {
- 		DC_LOGGER_INIT(ddc_service->ctx->logger);
-+#ifdef CONFIG_X86_PS5
-+		if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
-+		    init_data->id.enum_id == ENUM_ID_2)
-+			pr_info("PS5:  VBIOS i2c_info for USB-C: i2c_line=%d engine=%d hw_assist=%d",
-+				i2c_info.i2c_line, i2c_info.i2c_engine_id,
-+				i2c_info.i2c_hw_assist);
-+#endif
- 		DC_LOG_DC("BIOS object table - i2c_line: %d", i2c_info.i2c_line);
- 		DC_LOG_DC("BIOS object table - i2c_engine_id: %d", i2c_info.i2c_engine_id);
- 
-@@ -140,6 +157,21 @@ static void ddc_service_construct(
- 			&hw_info);
- 	}
- 
-+#ifdef CONFIG_X86_PS5
-+	/* PS5: For USB-C DP connector (enum_id=2), keep the VBIOS-assigned
-+	 * DDC pin (DDC2). The DDC GPIO pins are used for AUX engine
-+	 * selection — without a valid ddc_pin, the link encoder creation
-+	 * crashes (array index out of bounds on channel-1).
-+	 * The EDID reading the wrong display is a separate issue to
-+	 * investigate (possibly AUX engine routing or combo PHY config).
-+	 */
-+	if (connector_id == CONNECTOR_ID_DISPLAY_PORT &&
-+	    init_data->id.enum_id == ENUM_ID_2) {
-+		pr_info("PS5:  USB-C connector using VBIOS DDC pin (i2c_line=%d)",
-+			i2c_info.i2c_line);
-+	}
-+#endif
-+
- 	ddc_service->flags.EDID_QUERY_DONE_ONCE = false;
- 	ddc_service->flags.FORCE_READ_REPEATED_START = false;
- 	ddc_service->flags.EDID_STRESS_READ = false;
-
-diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
-index 02b7dc07a..a7d56d285 100644
---- a/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
-+++ b/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c
-@@ -65,6 +65,59 @@
- #include "dpcs/dpcs_2_0_3_offset.h"
- #include "dpcs/dpcs_2_0_3_sh_mask.h"
- 
-+/* PS5: dpcs_2_0_3 lacks several register offsets and field definitions
-+ * that DCN201 needs. They exist in dpcs_2_0_0. Define them here.
-+ */
-+
-+/* Missing register offsets (PHY_FUSE, DEBUG_CONFIG) */
-+#ifndef mmRDPCSTX0_RDPCSTX_PHY_FUSE0
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0                   0x294f
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE0_BASE_IDX          2
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1                   0x2950
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE1_BASE_IDX          2
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2                   0x2951
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE2_BASE_IDX          2
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3                   0x2952
-+#define mmRDPCSTX0_RDPCSTX_PHY_FUSE3_BASE_IDX          2
-+#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG                0x293d
-+#define mmRDPCSTX0_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
-+#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG                  0x292e
-+#define mmDPCSTX0_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0                   0x2a27
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE0_BASE_IDX          2
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1                   0x2a28
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE1_BASE_IDX          2
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2                   0x2a29
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE2_BASE_IDX          2
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3                   0x2a2a
-+#define mmRDPCSTX1_RDPCSTX_PHY_FUSE3_BASE_IDX          2
-+#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG                0x2a15
-+#define mmRDPCSTX1_RDPCSTX_DEBUG_CONFIG_BASE_IDX       2
-+#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG                  0x2a06
-+#define mmDPCSTX1_DPCSTX_DEBUG_CONFIG_BASE_IDX         2
-+#endif
-+
-+/* PS5: dpcs_2_0_3_sh_mask.h lacks DPALT and DP_REF_CLK_EN field definitions.
-+ * They exist in dpcs_2_0_0_sh_mask.h. Define them here so DPCS_MASK_SH_LIST
-+ * can initialize the shift/mask structs properly for combo PHY access.
-+ */
-+#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE__SHIFT          0x11
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_MASK            0x00020000L
-+#endif
-+#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK__SHIFT      0x12
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DISABLE_ACK_MASK        0x00040000L
-+#endif
-+#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4__SHIFT              0x10
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DPALT_DP4_MASK                0x00010000L
-+#endif
-+#ifndef RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN__SHIFT          0x13
-+#define RDPCSTX0_RDPCSTX_PHY_CNTL6__RDPCS_PHY_DP_REF_CLK_EN_MASK            0x00080000L
-+#endif
-+
- #include "mmhub/mmhub_2_0_0_offset.h"
- #include "mmhub/mmhub_2_0_0_sh_mask.h"
- #include "nbio/nbio_7_4_offset.h"
-@@ -393,7 +446,8 @@ static const struct dcn10_link_enc_hpd_registers link_enc_hpd_regs[] = {
- #define link_regs(id, phyid)\
- [id] = {\
- 	LE_DCN_COMMON_REG_LIST(id), \
--	UNIPHY_DCN2_REG_LIST(phyid) \
-+	UNIPHY_DCN2_REG_LIST(phyid), \
-+	DPCS_DCN2_CMN_REG_LIST(id) \
- }
- 
- static const struct dcn10_link_enc_registers link_enc_regs[] = {
-@@ -402,7 +456,11 @@ static const struct dcn10_link_enc_registers link_enc_regs[] = {
- };
- 
- #define LINK_ENCODER_MASK_SH_LIST_DCN201(mask_sh)\
--	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh)
-+	LINK_ENCODER_MASK_SH_LIST_DCN20(mask_sh),\
-+	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE, mask_sh),\
-+	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DISABLE_ACK, mask_sh),\
-+	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DPALT_DP4, mask_sh),\
-+	LE_SF(RDPCSTX0_RDPCSTX_PHY_CNTL6, RDPCS_PHY_DP_REF_CLK_EN, mask_sh)
- 
- static const struct dcn10_link_enc_shift le_shift = {
- 		LINK_ENCODER_MASK_SH_LIST_DCN201(__SHIFT)
-
-diff --git a/drivers/ps5/usbc.c b/drivers/ps5/usbc.c
-new file mode 100644
-index 000000000..9a6c55a99
---- /dev/null
-+++ b/drivers/ps5/usbc.c
-@@ -0,0 +1,759 @@
-+// SPDX-License-Identifier: GPL-2.0-only
-+/*
-+ * PS5 USB-C DP alt mode driver
-+ *
-+ * Communicates with the south bridge EMC FW via ICC USBC service
-+ * (service_id 0x12) to manage USB-C DisplayPort alternate mode.
-+ *
-+ * The EMC FW handles PD negotiation and mux configuration in firmware.
-+ * This driver queries connection state, receives hotplug notifications,
-+ * and forwards HPD events to the amdgpu display driver.
-+ */
-+
-+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-+
-+#include <linux/module.h>
-+#include <linux/moduleparam.h>
-+#include <linux/ps5.h>
-+#include <linux/workqueue.h>
-+#include <linux/spinlock.h>
-+#include <linux/delay.h>
-+#include <linux/slab.h>
-+#include <linux/kstrtox.h>
-+#include <linux/debugfs.h>
-+#include <linux/uaccess.h>
-+
-+/* ICC USBC msg_type values.
-+ *
-+ * All values confirmed from PS5 5.50 firmware kernel dump disassembly.
-+ */
-+static ushort msg_type_get_service_state = 0x00;
-+module_param(msg_type_get_service_state, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_service_state, "ICC USBC GET_SERVICE_STATE msg_type");
-+
-+static ushort msg_type_get_port_list = 0x01;
-+module_param(msg_type_get_port_list, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_port_list, "ICC USBC GET_PORT_LIST msg_type");
-+
-+static ushort msg_type_get_dev_conn_state = 0x0c;
-+module_param(msg_type_get_dev_conn_state, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_dev_conn_state, "ICC USBC GET_DEV_CONN_STATE msg_type");
-+
-+static ushort msg_type_set_pdcon_op_mode = 0x10;
-+module_param(msg_type_set_pdcon_op_mode, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_set_pdcon_op_mode, "ICC USBC SET_PDCON_OP_MODE msg_type");
-+
-+static ushort msg_type_get_pdcon_op_mode = 0x11;
-+module_param(msg_type_get_pdcon_op_mode, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_pdcon_op_mode, "ICC USBC GET_PDCON_OP_MODE msg_type");
-+
-+static ushort msg_type_set_opt_pdp_enable = 0x12;
-+module_param(msg_type_set_opt_pdp_enable, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_set_opt_pdp_enable, "ICC USBC SET_OPT_PDP_ENABLE msg_type");
-+
-+static ushort msg_type_notify_soc_working = 0x15;
-+module_param(msg_type_notify_soc_working, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_notify_soc_working, "ICC USBC NOTIFY_SOC_WORKING msg_type");
-+
-+static ushort msg_type_notify_soc_download_standby = 0x16;
-+module_param(msg_type_notify_soc_download_standby, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_notify_soc_download_standby, "ICC USBC NOTIFY_SOC_DOWNLOAD_STANDBY msg_type");
-+
-+static ushort msg_type_set_supported_device_list = 0x19;
-+module_param(msg_type_set_supported_device_list, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_set_supported_device_list, "ICC USBC SET_SUPPORTED_DEVICE_LIST msg_type");
-+
-+static ushort msg_type_get_pdcon_ic_type = 0x1b;
-+module_param(msg_type_get_pdcon_ic_type, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_pdcon_ic_type, "ICC USBC GET_PDCON_IC_TYPE msg_type");
-+
-+static ushort msg_type_get_pdcon_fw_ver = 0x1c;
-+module_param(msg_type_get_pdcon_fw_ver, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_get_pdcon_fw_ver, "ICC USBC GET_PDCON_FW_VER msg_type");
-+
-+static ushort msg_type_set_redriver_eqval = 0x20;
-+module_param(msg_type_set_redriver_eqval, ushort, 0644);
-+MODULE_PARM_DESC(msg_type_set_redriver_eqval, "ICC USBC SET_REDRIVER_EQVAL msg_type");
-+
-+/* OpMode for SET_PDCON_OP_MODE.
-+ * 5 = USB + DP (current value used by existing patch).
-+ * The PS5 OS also uses OpMode 4 in some contexts.
-+ */
-+static ushort pdcon_op_mode = 5;
-+module_param(pdcon_op_mode, ushort, 0644);
-+MODULE_PARM_DESC(pdcon_op_mode, "PDCON OpMode (5=USB+DP, 4=USB only?)");
-+
-+/* Enable value for SET_OPT_PDP_ENABLE.
-+ * 1 = enable DP power delivery (confirmed from firmware disassembly).
-+ * 2 = also accepted by firmware (meaning unclear, possibly disable or alt mode).
-+ */
-+static ushort opt_pdp_enable = 1;
-+module_param(opt_pdp_enable, ushort, 0644);
-+MODULE_PARM_DESC(opt_pdp_enable, "SET_OPT_PDP_ENABLE value (1=enable, 2=alt)");
-+
-+/* Port ID for ICC USBC commands.
-+ * The PS5 has one USB-C port. GET_DEV_CONN_STATE reply shows PortId=3
-+ * when queried with port_id=0. Try 3 if commands to port 0 don't work.
-+ * The PS5 OS firmware uses PortId(00) for SET_PDCON_OP_MODE.
-+ */
-+static ushort usbc_port_id = 0;
-+module_param(usbc_port_id, ushort, 0644);
-+MODULE_PARM_DESC(usbc_port_id, "USB-C port ID for ICC commands (0 or 3)");
-+
-+/* Notification msg_type for connection state change.
-+ * Based on the pattern (HDMI: 0x02, BUTTON: 0x8010/0x8011).
-+ * USBC notifications likely use 0x80xx.
-+ */
-+static ushort notif_msg_type_conn_state = 0x8001;
-+module_param(notif_msg_type_conn_state, ushort, 0644);
-+MODULE_PARM_DESC(notif_msg_type_conn_state, "USBC notification msg_type for connection state change");
-+
-+/* HPD callback registered by amdgpu_dm */
-+static ps5_usbc_hpd_callback_t hpd_callback;
-+static void *hpd_callback_data;
-+static DEFINE_SPINLOCK(hpd_callback_lock);
-+
-+/* Dedicated workqueue for HPD events (dc_link_detect can sleep) */
-+static struct workqueue_struct *hpd_wq;
-+static struct work_struct hpd_connect_work;
-+static struct work_struct hpd_disconnect_work;
-+
-+/* Polling state for connection monitoring (fallback if notifications don't work) */
-+static struct delayed_work usbc_poll_work;
-+static bool poll_enabled = true;
-+module_param(poll_enabled, bool, 0644);
-+MODULE_PARM_DESC(poll_enabled, "Enable connection state polling fallback");
-+
-+static unsigned int poll_interval_ms = 500;
-+module_param(poll_interval_ms, uint, 0644);
-+MODULE_PARM_DESC(poll_interval_ms, "Connection state poll interval in ms");
-+
-+/* Last known connection state for change detection */
-+static struct ps5_usbc_conn_state last_conn_state;
-+static bool last_conn_state_valid;
-+
-+/* Debug: last raw notification */
-+static u8 last_notif[ICC_MSG_MAX_SIZE];
-+static size_t last_notif_len;
-+static DEFINE_SPINLOCK(notif_lock);
-+
-+/* Forward declarations */
-+static void fire_hpd_event(enum ps5_usbc_hpd_event event);
-+
-+/* Dumps the connection state in the format matching the PS5 firmware:
-+ * PortId, ConnState, DevType, VconnReq, Power, Mux, Orient, DpAlt, PinAssign, Hpd
-+ */
-+static void dump_conn_state(const struct ps5_usbc_conn_state *s, const char *prefix)
-+{
-+	pr_info("[USBC] %s PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
-+		prefix, s->port_id, s->conn_state, s->dev_type,
-+		s->vconn_req, s->power, s->mux, s->orient,
-+		s->dp_alt, s->pin_assign, s->hpd);
-+}
-+
-+/* Build and send an ICC USBC query, returning the reply */
-+static int usbc_query(u16 msg_type, u8 port_id, u8 *reply, size_t reply_size)
-+{
-+	u8 buf[ICC_MSG_MAX_SIZE] = {};
-+	struct icc_msg *msg = (struct icc_msg *)buf;
-+	int ret;
-+
-+	if (!spcie_is_initialized())
-+		return -ENODEV;
-+
-+	msg->service_id = ICC_SERVICE_ID_USBC;
-+	msg->msg_type = msg_type;
-+	msg->length = ICC_MSG_MIN_SIZE;
-+	msg->data[0] = port_id;
-+
-+	ret = icc_query(buf, buf);
-+	if (ret)
-+		return ret;
-+
-+	if (reply && reply_size > 0) {
-+		msg = (struct icc_msg *)buf;
-+		if (msg->length > sizeof(*msg)) {
-+			size_t copy_len = min_t(size_t, msg->length - sizeof(*msg), reply_size);
-+			memcpy(reply, msg->data, copy_len);
-+		}
-+	}
-+
-+	return 0;
-+}
-+
-+int ps5_usbc_get_conn_state(u8 port_id, struct ps5_usbc_conn_state *state)
-+{
-+	u8 reply[ICC_MSG_MAX_SIZE];
-+	int ret;
-+
-+	if (!state)
-+		return -EINVAL;
-+
-+	ret = usbc_query(msg_type_get_dev_conn_state, port_id, reply, sizeof(reply));
-+	if (ret) {
-+		pr_err("GET_DEV_CONN_STATE [NG][%d] PortId(%02X)\n", ret, port_id);
-+		return ret;
-+	}
-+
-+	/* Reply data layout (from PS5 firmware dump format string).
-+	 * The first 2 bytes of reply data are a status/header (00 00 = OK).
-+	 * Actual connection state starts at data[2].
-+	 * data[0] = status_hi
-+	 * data[1] = status_lo
-+	 * data[2] = PortId
-+	 * data[3] = ConnState
-+	 * data[4] = DevType
-+	 * data[5] = VconnReq
-+	 * data[6] = Power
-+	 * data[7] = Mux
-+	 * data[8] = Orient
-+	 * data[9] = DpAlt
-+	 * data[10] = PinAssign
-+	 * data[11] = Hpd
-+	 */
-+	state->port_id = reply[2];
-+	state->conn_state = reply[3];
-+	state->dev_type = reply[4];
-+	state->vconn_req = reply[5];
-+	state->power = reply[6];
-+	state->mux = reply[7];
-+	state->orient = reply[8];
-+	state->dp_alt = reply[9];
-+	state->pin_assign = reply[10];
-+	state->hpd = reply[11];
-+
-+	dump_conn_state(state, "GET_DEV_CONN_STATE [OK]");
-+	return 0;
-+}
-+EXPORT_SYMBOL(ps5_usbc_get_conn_state);
-+
-+int ps5_usbc_set_pdcon_op_mode(u8 port_id, u8 op_mode)
-+{
-+	u8 buf[ICC_MSG_MAX_SIZE] = {};
-+	struct icc_msg *msg = (struct icc_msg *)buf;
-+
-+	msg->service_id = ICC_SERVICE_ID_USBC;
-+	msg->msg_type = msg_type_set_pdcon_op_mode;
-+	msg->length = ICC_MSG_MIN_SIZE;
-+	msg->data[0] = port_id;
-+	msg->data[1] = op_mode;
-+
-+	pr_info("[USBC] SET_PDCON_OP_MODE PortId(%02X) OpMode(%u)\n", port_id, op_mode);
-+
-+	return icc_query(buf, buf);
-+}
-+EXPORT_SYMBOL(ps5_usbc_set_pdcon_op_mode);
-+
-+int ps5_usbc_set_opt_pdp_enable(u8 port_id, u8 enable)
-+{
-+	u8 buf[ICC_MSG_MAX_SIZE] = {};
-+	struct icc_msg *msg = (struct icc_msg *)buf;
-+
-+	msg->service_id = ICC_SERVICE_ID_USBC;
-+	msg->msg_type = msg_type_set_opt_pdp_enable;
-+	msg->length = ICC_MSG_MIN_SIZE;
-+	msg->data[0] = port_id;
-+	msg->data[1] = enable;
-+
-+	pr_info("[USBC] SET_OPT_PDP_ENABLE PortId(%02X) Enable(%u)\n", port_id, enable);
-+
-+	return icc_query(buf, buf);
-+}
-+EXPORT_SYMBOL(ps5_usbc_set_opt_pdp_enable);
-+
-+int ps5_usbc_notify_soc_working(u8 port_id)
-+{
-+	pr_info("[USBC] NOTIFY_SOC_WORKING PortId(%02X)\n", port_id);
-+	return usbc_query(msg_type_notify_soc_working, port_id, NULL, 0);
-+}
-+EXPORT_SYMBOL(ps5_usbc_notify_soc_working);
-+
-+int ps5_usbc_set_supported_device_list(u8 port_id, const u8 *devices, u8 device_num)
-+{
-+	u8 buf[ICC_MSG_MAX_SIZE] = {};
-+	struct icc_msg *msg = (struct icc_msg *)buf;
-+	int i;
-+
-+	if (device_num > 8)
-+		return -EINVAL;
-+
-+	msg->service_id = ICC_SERVICE_ID_USBC;
-+	msg->msg_type = msg_type_set_supported_device_list;
-+	msg->length = ICC_MSG_MIN_SIZE;
-+	msg->data[0] = port_id;
-+	msg->data[1] = device_num;
-+
-+	/* Each device entry is 3 bytes (from firmware disassembly:
-+	 * lea rcx, [rax + rax*2] = device_num * 3)
-+	 */
-+	for (i = 0; i < device_num && i < 8; i++) {
-+		msg->data[2 + i * 3] = devices[i];
-+		msg->length += 3;
-+	}
-+
-+	pr_info("[USBC] SET_SUPPORTED_DEVICE_LIST PortId(%02X) DeviceNum(%02X)\n",
-+		port_id, device_num);
-+
-+	return icc_query(buf, buf);
-+}
-+EXPORT_SYMBOL(ps5_usbc_set_supported_device_list);
-+
-+int ps5_usbc_register_hpd_callback(ps5_usbc_hpd_callback_t callback, void *data)
-+{
-+	unsigned long flags;
-+
-+	spin_lock_irqsave(&hpd_callback_lock, flags);
-+	hpd_callback = callback;
-+	hpd_callback_data = data;
-+	spin_unlock_irqrestore(&hpd_callback_lock, flags);
-+
-+	pr_info("[USBC] HPD callback registered\n");
-+
-+	/* If a device is already connected, fire CONNECT immediately.
-+	 * The USBC driver loads before amdgpu, so the initial connection
-+	 * state is captured before the callback is registered.
-+	 */
-+	if (last_conn_state_valid && last_conn_state.dp_alt &&
-+	    last_conn_state.conn_state) {
-+		pr_info("[USBC] Device already connected, firing initial HPD CONNECT\n");
-+		fire_hpd_event(PS5_USBC_HPD_CONNECT);
-+	}
-+
-+	return 0;
-+}
-+EXPORT_SYMBOL(ps5_usbc_register_hpd_callback);
-+
-+void ps5_usbc_unregister_hpd_callback(void)
-+{
-+	unsigned long flags;
-+
-+	spin_lock_irqsave(&hpd_callback_lock, flags);
-+	hpd_callback = NULL;
-+	hpd_callback_data = NULL;
-+	spin_unlock_irqrestore(&hpd_callback_lock, flags);
-+
-+	pr_info("[USBC] HPD callback unregistered\n");
-+}
-+EXPORT_SYMBOL(ps5_usbc_unregister_hpd_callback);
-+
-+bool ps5_usbc_is_dp_alt_active(u8 port_id)
-+{
-+	struct ps5_usbc_conn_state state;
-+	int ret;
-+
-+	ret = ps5_usbc_get_conn_state(port_id, &state);
-+	if (ret)
-+		return false;
-+
-+	return state.dp_alt != 0 && state.conn_state != 0;
-+}
-+EXPORT_SYMBOL(ps5_usbc_is_dp_alt_active);
-+
-+static void hpd_connect_work_fn(struct work_struct *work)
-+{
-+	ps5_usbc_hpd_callback_t cb;
-+	void *cb_data;
-+	unsigned long flags;
-+
-+	spin_lock_irqsave(&hpd_callback_lock, flags);
-+	cb = hpd_callback;
-+	cb_data = hpd_callback_data;
-+	spin_unlock_irqrestore(&hpd_callback_lock, flags);
-+
-+	if (cb) {
-+		pr_info("[USBC] Firing HPD CONNECT\n");
-+		cb(PS5_USBC_HPD_CONNECT, cb_data);
-+	}
-+}
-+
-+static void hpd_disconnect_work_fn(struct work_struct *work)
-+{
-+	ps5_usbc_hpd_callback_t cb;
-+	void *cb_data;
-+	unsigned long flags;
-+
-+	spin_lock_irqsave(&hpd_callback_lock, flags);
-+	cb = hpd_callback;
-+	cb_data = hpd_callback_data;
-+	spin_unlock_irqrestore(&hpd_callback_lock, flags);
-+
-+	if (cb) {
-+		pr_info("[USBC] Firing HPD DISCONNECT\n");
-+		cb(PS5_USBC_HPD_DISCONNECT, cb_data);
-+	}
-+}
-+
-+static void fire_hpd_event(enum ps5_usbc_hpd_event event)
-+{
-+	if (!hpd_wq)
-+		return;
-+
-+	switch (event) {
-+	case PS5_USBC_HPD_CONNECT:
-+		queue_work(hpd_wq, &hpd_connect_work);
-+		break;
-+	case PS5_USBC_HPD_DISCONNECT:
-+		queue_work(hpd_wq, &hpd_disconnect_work);
-+		break;
-+	case PS5_USBC_HPD_IRQ:
-+		queue_work(hpd_wq, &hpd_connect_work);
-+		break;
-+	default:
-+		break;
-+	}
-+}
-+
-+/* Manually trigger HPD (for testing/debug) */
-+void ps5_usbc_trigger_hpd(void)
-+{
-+	struct ps5_usbc_conn_state state;
-+	int ret;
-+
-+	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
-+	if (ret) {
-+		pr_warn("[USBC] trigger_hpd: failed to get conn state\n");
-+		return;
-+	}
-+
-+	/* Fire CONNECT when DP alt mode is active (DpAlt=1 and ConnState=1).
-+	 * The Hpd field may be 0 initially — the display asserts HPD after
-+	 * link training starts. We trigger CONNECT to begin that process.
-+	 */
-+	if (state.dp_alt && state.conn_state)
-+		fire_hpd_event(PS5_USBC_HPD_CONNECT);
-+	else
-+		fire_hpd_event(PS5_USBC_HPD_DISCONNECT);
-+}
-+EXPORT_SYMBOL(ps5_usbc_trigger_hpd);
-+
-+/* Notification handler - called from spcie.c icc_notification_work_func */
-+void usbc_notification_handler(struct icc_msg *msg)
-+{
-+	unsigned long flags;
-+	enum ps5_usbc_hpd_event event = PS5_USBC_HPD_NONE;
-+
-+	/* Save raw notification for debug */
-+	spin_lock_irqsave(&notif_lock, flags);
-+	last_notif_len = min_t(size_t, msg->length, ICC_MSG_MAX_SIZE);
-+	memcpy(last_notif, msg, last_notif_len);
-+	spin_unlock_irqrestore(&notif_lock, flags);
-+
-+	pr_info("[USBC] notification msg_type=0x%04X len=%u\n",
-+		msg->msg_type, msg->length);
-+
-+	if (msg->length > sizeof(*msg)) {
-+		print_hex_dump(KERN_INFO, "[USBC] notif: ", DUMP_PREFIX_OFFSET,
-+			       16, 1, msg->data, msg->length - sizeof(*msg), true);
-+	}
-+
-+	/* Parse notification based on msg_type.
-+	 * The notification data likely contains the same fields as
-+	 * GET_DEV_CONN_STATE reply: PortId, ConnState, DevType, ...,
-+	 * DpAlt, PinAssign, Hpd.
-+	 */
-+	if (msg->msg_type == notif_msg_type_conn_state) {
-+		struct ps5_usbc_conn_state state = {};
-+		u8 *d = msg->data;
-+		size_t data_len = msg->length > sizeof(*msg) ?
-+			msg->length - sizeof(*msg) : 0;
-+
-+		if (data_len >= 12) {
-+			/* Skip 2-byte status header, same as GET_DEV_CONN_STATE */
-+			state.port_id = d[2];
-+			state.conn_state = d[3];
-+			state.dev_type = d[4];
-+			state.vconn_req = d[5];
-+			state.power = d[6];
-+			state.mux = d[7];
-+			state.orient = d[8];
-+			state.dp_alt = d[9];
-+			state.pin_assign = d[10];
-+			state.hpd = d[11];
-+
-+			dump_conn_state(&state, "notification");
-+
-+			if (state.dp_alt && state.conn_state)
-+				event = PS5_USBC_HPD_CONNECT;
-+			else
-+				event = PS5_USBC_HPD_DISCONNECT;
-+		}
-+	} else {
-+		/* Unknown notification msg_type - try to parse as conn state anyway */
-+		u8 *d = msg->data;
-+		size_t data_len = msg->length > sizeof(*msg) ?
-+			msg->length - sizeof(*msg) : 0;
-+
-+		if (data_len >= 12) {
-+			pr_info("[USBC] unknown notif, trying conn state parse:\n");
-+			pr_info("[USBC]   PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
-+				d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11]);
-+
-+			if (d[9] /* dp_alt */ && d[3] /* conn_state */)
-+				event = PS5_USBC_HPD_CONNECT;
-+			else
-+				event = PS5_USBC_HPD_DISCONNECT;
-+		}
-+	}
-+
-+	if (event != PS5_USBC_HPD_NONE)
-+		fire_hpd_event(event);
-+}
-+EXPORT_SYMBOL(usbc_notification_handler);
-+
-+/* Polling workqueue - fallback for connection state monitoring */
-+static void usbc_poll_fn(struct work_struct *work)
-+{
-+	struct ps5_usbc_conn_state state;
-+	int ret;
-+
-+	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
-+	if (ret) {
-+		schedule_delayed_work(&usbc_poll_work,
-+				      msecs_to_jiffies(poll_interval_ms));
-+		return;
-+	}
-+
-+	if (!last_conn_state_valid) {
-+		last_conn_state = state;
-+		last_conn_state_valid = true;
-+		/* If already connected at boot, fire connect event */
-+		if (state.dp_alt && state.conn_state)
-+			fire_hpd_event(PS5_USBC_HPD_CONNECT);
-+	} else {
-+		/* Detect changes in dp_alt + conn_state (connection status) */
-+		bool was_connected = last_conn_state.dp_alt && last_conn_state.conn_state;
-+		bool is_connected = state.dp_alt && state.conn_state;
-+
-+		if (is_connected && !was_connected)
-+			fire_hpd_event(PS5_USBC_HPD_CONNECT);
-+		else if (!is_connected && was_connected)
-+			fire_hpd_event(PS5_USBC_HPD_DISCONNECT);
-+
-+		last_conn_state = state;
-+	}
-+
-+	schedule_delayed_work(&usbc_poll_work, msecs_to_jiffies(poll_interval_ms));
-+}
-+
-+/* Probe interface - try a msg_type and log the result */
-+int ps5_usbc_probe_msg_type(u16 msg_type, u8 port_id, u8 *reply, size_t reply_size)
-+{
-+	pr_info("[USBC] probing msg_type=0x%04X PortId(%02X)\n", msg_type, port_id);
-+	return usbc_query(msg_type, port_id, reply, reply_size);
-+}
-+EXPORT_SYMBOL(ps5_usbc_probe_msg_type);
-+
-+/* DebugFS interface */
-+static struct dentry *usbc_debugfs_dir;
-+
-+static int usbc_debugfs_conn_state_show(struct seq_file *m, void *data)
-+{
-+	struct ps5_usbc_conn_state state;
-+	int ret;
-+
-+	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &state);
-+	if (ret) {
-+		seq_printf(m, "GET_DEV_CONN_STATE failed: %d\n", ret);
-+		return 0;
-+	}
-+
-+	seq_printf(m, "PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
-+		state.port_id, state.conn_state, state.dev_type,
-+		state.vconn_req, state.power, state.mux, state.orient,
-+		state.dp_alt, state.pin_assign, state.hpd);
-+	seq_printf(m, "DP alt mode active: %s\n",
-+		(state.dp_alt && state.conn_state) ? "yes" : "no");
-+	return 0;
-+}
-+DEFINE_SHOW_ATTRIBUTE(usbc_debugfs_conn_state);
-+
-+static int usbc_debugfs_last_notif_show(struct seq_file *m, void *data)
-+{
-+	unsigned long flags;
-+	u8 buf[ICC_MSG_MAX_SIZE];
-+	size_t len;
-+	struct icc_msg *msg;
-+	u8 *d;
-+	size_t data_len;
-+	int i;
-+
-+	spin_lock_irqsave(&notif_lock, flags);
-+	len = last_notif_len;
-+	memcpy(buf, last_notif, len);
-+	spin_unlock_irqrestore(&notif_lock, flags);
-+
-+	if (len == 0) {
-+		seq_puts(m, "No notifications received yet\n");
-+		return 0;
-+	}
-+
-+	msg = (struct icc_msg *)buf;
-+	seq_printf(m, "msg_type=0x%04X length=%u\n", msg->msg_type, msg->length);
-+	data_len = len > sizeof(*msg) ? len - sizeof(*msg) : 0;
-+	d = msg->data;
-+	seq_printf(m, "data (%zu bytes):", data_len);
-+	for (i = 0; i < data_len; i++)
-+		seq_printf(m, " %02x", d[i]);
-+	seq_putc(m, '\n');
-+
-+	if (data_len >= 10) {
-+		seq_printf(m, "Parsed: PortId(%02X) ConnState(%u) DevType(%u) VconnReq(%u) Power(%u) Mux(%u) Orient(%u) DpAlt(%u) PinAssign(%u) Hpd(%u)\n",
-+			d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
-+	}
-+	return 0;
-+}
-+DEFINE_SHOW_ATTRIBUTE(usbc_debugfs_last_notif);
-+
-+static ssize_t usbc_debugfs_probe_write(struct file *file, const char __user *buf,
-+					size_t count, loff_t *ppos)
-+{
-+	char input[32];
-+	u16 msg_type;
-+	u8 reply[ICC_MSG_MAX_SIZE];
-+	int ret;
-+	size_t reply_len;
-+
-+	if (count >= sizeof(input))
-+		return -EINVAL;
-+	if (copy_from_user(input, buf, count))
-+		return -EFAULT;
-+	input[count] = 0;
-+
-+	if (kstrtou16(input, 0, &msg_type))
-+		return -EINVAL;
-+
-+	ret = ps5_usbc_probe_msg_type(msg_type, 0, reply, sizeof(reply));
-+	if (ret) {
-+		pr_info("[USBC] probe msg_type=0x%04X FAILED: %d\n", msg_type, ret);
-+		return count;
-+	}
-+
-+	reply_len = min_t(size_t, sizeof(reply), 32);
-+	pr_info("[USBC] probe msg_type=0x%04X OK reply:", msg_type);
-+	print_hex_dump(KERN_INFO, "[USBC]   ", DUMP_PREFIX_OFFSET,
-+		       16, 1, reply, reply_len, true);
-+	return count;
-+}
-+
-+static const struct file_operations usbc_debugfs_probe_fops = {
-+	.owner = THIS_MODULE,
-+	.write = usbc_debugfs_probe_write,
-+};
-+
-+static ssize_t usbc_debugfs_trigger_hpd_write(struct file *file, const char __user *buf,
-+					       size_t count, loff_t *ppos)
-+{
-+	ps5_usbc_trigger_hpd();
-+	return count;
-+}
-+
-+static const struct file_operations usbc_debugfs_trigger_hpd_fops = {
-+	.owner = THIS_MODULE,
-+	.write = usbc_debugfs_trigger_hpd_write,
-+};
-+
-+static struct delayed_work usbc_init_work;
-+static bool usbc_initialized;
-+
-+static void ps5_usbc_do_init(struct work_struct *work)
-+{
-+	int ret;
-+
-+	if (!spcie_is_initialized()) {
-+		pr_info("[USBC] spcie not initialized, retrying in 1s\n");
-+		schedule_delayed_work(&usbc_init_work, msecs_to_jiffies(1000));
-+		return;
-+	}
-+
-+	/* Create dedicated HPD workqueue (dc_link_detect can sleep) */
-+	hpd_wq = alloc_workqueue("ps5_usbc_hpd", WQ_UNBOUND, 0);
-+	INIT_WORK(&hpd_connect_work, hpd_connect_work_fn);
-+	INIT_WORK(&hpd_disconnect_work, hpd_disconnect_work_fn);
-+
-+	/* Enable DP alt mode on the USB-C port */
-+	ret = ps5_usbc_set_pdcon_op_mode((u8)usbc_port_id, (u8)pdcon_op_mode);
-+	if (ret)
-+		pr_warn("[USBC] SET_PDCON_OP_MODE failed: %d\n", ret);
-+
-+	/* Enable DP power delivery (OPT_PDP_ENABLE) */
-+	ret = ps5_usbc_set_opt_pdp_enable((u8)usbc_port_id, (u8)opt_pdp_enable);
-+	if (ret)
-+		pr_warn("[USBC] SET_OPT_PDP_ENABLE failed: %d\n", ret);
-+
-+	/* Notify SOC that we're working */
-+	ret = ps5_usbc_notify_soc_working((u8)usbc_port_id);
-+	if (ret)
-+		pr_warn("[USBC] NOTIFY_SOC_WORKING failed: %d\n", ret);
-+
-+	/* Get initial connection state */
-+	ret = ps5_usbc_get_conn_state((u8)usbc_port_id, &last_conn_state);
-+	if (ret) {
-+		pr_warn("[USBC] initial GET_DEV_CONN_STATE failed: %d\n", ret);
-+		last_conn_state_valid = false;
-+	} else {
-+		last_conn_state_valid = true;
-+		if (last_conn_state.dp_alt && last_conn_state.conn_state)
-+			pr_info("[USBC] DP alt mode active at boot\n");
-+		else
-+			pr_info("[USBC] DP alt mode not active at boot\n");
-+	}
-+
-+	/* Start polling for connection state changes */
-+	if (poll_enabled) {
-+		INIT_DELAYED_WORK(&usbc_poll_work, usbc_poll_fn);
-+		schedule_delayed_work(&usbc_poll_work,
-+				      msecs_to_jiffies(poll_interval_ms));
-+	}
-+
-+	/* Create debugfs interface */
-+	usbc_debugfs_dir = debugfs_create_dir("ps5_usbc", NULL);
-+	if (usbc_debugfs_dir) {
-+		debugfs_create_file("conn_state", 0444, usbc_debugfs_dir, NULL,
-+				    &usbc_debugfs_conn_state_fops);
-+		debugfs_create_file("last_notif", 0444, usbc_debugfs_dir, NULL,
-+				    &usbc_debugfs_last_notif_fops);
-+		debugfs_create_file("probe", 0220, usbc_debugfs_dir, NULL,
-+				    &usbc_debugfs_probe_fops);
-+		debugfs_create_file("trigger_hpd", 0220, usbc_debugfs_dir, NULL,
-+				    &usbc_debugfs_trigger_hpd_fops);
-+	}
-+
-+	usbc_initialized = true;
-+	pr_info("[USBC] PS5 USB-C DP alt mode driver initialized\n");
-+}
-+
-+static int __init ps5_usbc_init(void)
-+{
-+	INIT_DELAYED_WORK(&usbc_init_work, ps5_usbc_do_init);
-+	schedule_delayed_work(&usbc_init_work, msecs_to_jiffies(1000));
-+	return 0;
-+}
-+
-+static void __exit ps5_usbc_exit(void)
-+{
-+	cancel_delayed_work_sync(&usbc_init_work);
-+
-+	if (usbc_initialized && poll_enabled)
-+		cancel_delayed_work_sync(&usbc_poll_work);
-+
-+	if (hpd_wq) {
-+		cancel_work_sync(&hpd_connect_work);
-+		cancel_work_sync(&hpd_disconnect_work);
-+		destroy_workqueue(hpd_wq);
-+		hpd_wq = NULL;
-+	}
-+
-+	debugfs_remove_recursive(usbc_debugfs_dir);
-+	ps5_usbc_unregister_hpd_callback();
-+	pr_info("[USBC] PS5 USB-C DP alt mode driver removed\n");
-+}
-+
-+/* The spcie driver is a PCI driver that probes asynchronously.
-+ * Use a delayed workqueue to retry until spcie is ready.
-+ */
-+late_initcall(ps5_usbc_init);
-+module_exit(ps5_usbc_exit);
-+
-+MODULE_AUTHOR("PS5 Linux Community");
-+MODULE_DESCRIPTION("PS5 USB-C DisplayPort alt mode driver");
-+MODULE_LICENSE("GPL");
-
 diff --git a/include/linux/ps5.h b/include/linux/ps5.h
 new file mode 100644
-index 000000000..3d24020ac
+index 000000000..9f1e3646d
 --- /dev/null
 +++ b/include/linux/ps5.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,149 @@
 +#ifndef _LINUX_PS5_H
 +#define _LINUX_PS5_H
 +
@@ -11607,6 +11758,23 @@ index 000000000..3d24020ac
 +void ps5_usbc_trigger_hpd(void);
 +int ps5_usbc_set_supported_device_list(u8 port_id, const u8 *devices, u8 device_num);
 +
++/* ICC-based EDID read for USB-C display.
++ * Sends ICC HDMI EDID read query (service_id=0x10) and waits for
++ * EDID notification. The PS5 firmware uses ICC for all display
++ * communication — the GPU's AUX engine is not used for USB-C.
++ *
++ * @edid: output buffer for EDID data (at least 256 bytes)
++ * @max_len: size of edid buffer
++ *
++ * Returns EDID length on success, negative error code on failure.
++ */
++int ps5_usbc_read_edid(u8 *edid, size_t max_len);
++
++/* Called by hdmi_notification_handler when EDID notification arrives.
++ * Used internally by ps5_usbc_read_edid to receive EDID via ICC.
++ */
++void ps5_usbc_handle_edid_notification(const u8 *data, size_t data_len);
++
 +/* Probe/debug interface */
 +int ps5_usbc_probe_msg_type(u16 msg_type, u8 port_id, u8 *reply, size_t reply_size);
 +
@@ -11616,3 +11784,66 @@ index 000000000..3d24020ac
 +u64 svm_execute_guest(void *guest_func, u64 a0, u64 a1, u64 a2, u64 a3);
 +
 +#endif /* _LINUX_PS5_H */
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 572b1c620..77052a211 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -309,6 +309,14 @@ enum {
+ 	 */
+ 	HCI_QUIRK_BROKEN_SET_RPA_TIMEOUT,
+ 
++	/* When this quirk is set, the HCI_OP_LE_SET_DEFAULT_PHY command is
++	 * skipped during initialization. This is required for controllers
++	 * which advertise the command but reject the default 1M PHY request.
++	 *
++	 * This quirk can be set before hci_register_dev is called.
++	 */
++	HCI_QUIRK_BROKEN_SET_DEFAULT_PHY,
++
+ 	/*
+ 	 * When this quirk is set, the HCI_OP_LE_EXT_CREATE_CONN command is
+ 	 * disabled. This is required for the Actions Semiconductor ATS2851
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+index df23245d6..ee17cedeb 100644
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -4874,6 +4874,12 @@ static int hci_le_set_default_phy_sync(struct hci_dev *hdev)
+ {
+ 	struct hci_cp_le_set_default_phy cp;
+ 
++	if (hci_test_quirk(hdev, HCI_QUIRK_BROKEN_SET_DEFAULT_PHY)) {
++		hdev->le_tx_def_phys = HCI_LE_SET_PHY_1M;
++		hdev->le_rx_def_phys = HCI_LE_SET_PHY_1M;
++		return 0;
++	}
++
+ 	if (!(hdev->commands[35] & 0x20)) {
+ 		/* If the command is not supported it means only 1M PHY is
+ 		 * supported.
+diff --git a/scripts/setlocalversion b/scripts/setlocalversion
+index 28169d7e1..44f516daa 100755
+--- a/scripts/setlocalversion
++++ b/scripts/setlocalversion
+@@ -61,6 +61,9 @@ scm_version()
+ 	local no_dirty=false
+ 	local tag
+ 
++	# Do not add any suffix for ps5-linux.
++	return
++
+ 	while [ $# -gt 0 ];
+ 	do
+ 		case "$1" in
+diff --git a/sound/hda/controllers/intel.c b/sound/hda/controllers/intel.c
+index 4b03c64e7..4cb7d285c 100644
+--- a/sound/hda/controllers/intel.c
++++ b/sound/hda/controllers/intel.c
+@@ -2643,6 +2643,8 @@ static const struct pci_device_id azx_ids[] = {
+ 	  AZX_DCAPS_PM_RUNTIME },
+ 	{ PCI_VDEVICE(ATI, 0x1308),
+ 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
++	{ PCI_VDEVICE(ATI, 0x13ea),
++	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
+ 	{ PCI_VDEVICE(ATI, 0x157a),
+ 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
+ 	{ PCI_VDEVICE(ATI, 0x15b3),
