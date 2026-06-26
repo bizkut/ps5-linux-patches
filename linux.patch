@@ -1991,7 +1991,7 @@ index a3cb05490..26fe598bd 100644
  	 * do check sum and retry to make sure read correct edid.
  	 */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-index be038d901..a1b1c3100 100644
+index be038d901..325103911 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
 @@ -86,6 +86,15 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
@@ -2001,7 +2001,7 @@ index be038d901..a1b1c3100 100644
 +#ifdef CONFIG_X86_PS5
 +	{
 +		struct ddc_service *dbg_ddc = TO_DM_AUX(aux)->ddc_service;
-+		pr_info("PS5: dm_dp_aux_transfer: ddc_service=%p ddc_pin=%p addr=0x%04x len=%d",
++		pr_info("PS5: dm_dp_aux_transfer: ddc_service=%p ddc_pin=%p addr=0x%04x len=%zu\n",
 +			dbg_ddc,
 +			(dbg_ddc && dbg_ddc->ddc_pin) ? dbg_ddc->ddc_pin : NULL,
 +			msg->address, msg->size);
