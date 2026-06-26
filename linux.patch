@@ -2636,7 +2636,7 @@ index ae4c4ad05..118ab5c4e 100644
  	DC_LOG_DC("BIOS object table - IS_DP2_CAPABLE: %d", link->link_enc->features.flags.bits.IS_DP2_CAPABLE);
  
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
-index a66217e54..c52bc8cc0 100644
+index a66217e54..6a5bae1f3 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c
 @@ -37,6 +37,11 @@
@@ -2672,10 +2672,29 @@ index a66217e54..c52bc8cc0 100644
  		DC_LOG_DC("BIOS object table - i2c_line: %d", i2c_info.i2c_line);
  		DC_LOG_DC("BIOS object table - i2c_engine_id: %d", i2c_info.i2c_engine_id);
  
-@@ -140,6 +157,21 @@ static void ddc_service_construct(
+@@ -138,7 +155,39 @@ static void ddc_service_construct(
+ 			i2c_info.gpio_info.clk_a_register_index,
+ 			1 << i2c_info.gpio_info.clk_a_shift,
  			&hw_info);
- 	}
- 
++
++		/* PS5 USB-C: The VBIOS maps both HDMI (enum_id=1) and USB-C
++		 * (enum_id=2) connectors to the same DDC GPIO pin (DDC1),
++		 * which results in both using AUX engine 0 (en=0).
++		 * The USB-C connector should use AUX engine 1 (en=1) since
++		 * it has its own AUX channel via the combo PHY SBU pins.
++		 * Override the DDC pin's engine number for USB-C.
++		 */
++		if (init_data->id.enum_id == ENUM_ID_2 &&
++		    init_data->id.type == OBJECT_TYPE_CONNECTOR &&
++		    connector_id == CONNECTOR_ID_DISPLAY_PORT) {
++			if (ddc_service->ddc_pin && ddc_service->ddc_pin->pin_data) {
++				pr_info("PS5:  Overriding DDC engine for USB-C: %d -> 1 (DDC2/AUX1)",
++					ddc_service->ddc_pin->pin_data->en);
++				ddc_service->ddc_pin->pin_data->en = GPIO_DDC_LINE_DDC2;
++			}
++		}
++	}
++
 +#ifdef CONFIG_X86_PS5
 +	/* PS5: For USB-C DP connector (enum_id=2), keep the VBIOS-assigned
 +	 * DDC pin (DDC2). The DDC GPIO pins are used for AUX engine
@@ -2688,12 +2707,11 @@ index a66217e54..c52bc8cc0 100644
 +	    init_data->id.enum_id == ENUM_ID_2) {
 +		pr_info("PS5:  USB-C connector using VBIOS DDC pin (i2c_line=%d)",
 +			i2c_info.i2c_line);
-+	}
+ 	}
 +#endif
-+
+ 
  	ddc_service->flags.EDID_QUERY_DONE_ONCE = false;
  	ddc_service->flags.FORCE_READ_REPEATED_START = false;
- 	ddc_service->flags.EDID_STRESS_READ = false;
 diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
 index 782a45caa..444259795 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
