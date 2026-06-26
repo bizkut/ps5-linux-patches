@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..20a4192b9 100644
+index a3cb05490..e2ec51a50 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..20a4192b9 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,52 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,58 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1908,8 +1908,14 @@ index a3cb05490..20a4192b9 100644
 +	 * The PS5 firmware uses ICC (service_id=0x10) for all display
 +	 * communication. The GPU's AUX engine is NOT used for USB-C.
 +	 * AUX transactions always time out for USB-C (DP-2).
++	 *
++	 * Detection: DP_IS_USB_C flag is set in link_factory.c for
++	 * enum_id=2 connector. We also check is_in_alt_mode to confirm
++	 * DP alt mode is active.
 +	 */
 +	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
++	    link->link_enc &&
++	    link->link_enc->features.flags.bits.DP_IS_USB_C &&
 +	    link->link_enc->funcs->is_in_alt_mode &&
 +	    link->link_enc->funcs->is_in_alt_mode(link->link_enc)) {
 +		u8 icc_edid[512];
@@ -9928,10 +9934,10 @@ index 000000000..23de43ea4
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/ps5/usbc.c b/drivers/ps5/usbc.c
 new file mode 100644
-index 000000000..ec444a62b
+index 000000000..c047e54ab
 --- /dev/null
 +++ b/drivers/ps5/usbc.c
-@@ -0,0 +1,987 @@
+@@ -0,0 +1,1054 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * PS5 USB-C DP alt mode driver
@@ -9949,6 +9955,7 @@ index 000000000..ec444a62b
 +#include <linux/module.h>
 +#include <linux/moduleparam.h>
 +#include <linux/ps5.h>
++#include <drm/drm_edid.h>
 +#include <linux/workqueue.h>
 +#include <linux/spinlock.h>
 +#include <linux/delay.h>
@@ -10297,16 +10304,20 @@ index 000000000..ec444a62b
 + *
 + * The PS5 firmware uses ICC (service_id=0x10, HDMI service) for all
 + * display communication. The GPU's AUX engine is NOT used for USB-C.
-+ * This function:
-+ * 1. Sends ICC EDID read query to the south bridge
-+ * 2. Waits for EDID notification (data[1]==0x02)
-+ * 3. Returns EDID data
++ *
++ * The firmware's EDID read function (offset 0x0090fa90) does TWO ICC calls:
++ * 1. Setup command (length=0x6c, data[3]=9) — configures display path
++ * 2. EDID read command (length=0x20, data[3]=1) — triggers EDID read
++ *
++ * The EDID data is returned asynchronously via ICC notification
++ * (service_id=0x10, data[1]==0x02), not in the query reply.
++ * The query reply only contains status (data[0]==0, data[1]==0 = OK).
 + *
 + * Based on firmware disassembly at offset 0x0090fa90.
 + */
 +int ps5_usbc_read_edid(u8 *edid, size_t max_len)
 +{
-+	u8 buf[ICC_MSG_MAX_SIZE] = {};
++	u8 buf[ICC_MSG_MAX_SIZE];
 +	struct icc_msg *msg = (struct icc_msg *)buf;
 +	int ret;
 +	unsigned long timeout;
@@ -10324,60 +10335,119 @@ index 000000000..ec444a62b
 +	reinit_completion(&usbc_edid_done);
 +	mutex_unlock(&usbc_edid_lock);
 +
-+	/* Build ICC HDMI EDID read query.
-+	 * Format from firmware disassembly (offset 0x0090fc87):
-+	 *   service_id = 0x10 (HDMI)
-+	 *   msg_type   = 0
-+	 *   length     = 0x20 (32 bytes total)
-+	 *   data[0]    = 4 (EDID read command)
-+	 *   data[1:2]  = 0x000c
-+	 *   data[3]    = 1
-+	 *   data[4]    = 1
-+	 *   data[5]    = 8
-+	 *   data[6]    = 1
-+	 *   data[7]    = 1
-+	 *   data[8]    = 1
-+	 *   data[9]    = 0x7c (I2C EDID address)
-+	 *   data[10]   = 0
++	/* === Step 1: Send setup command (length=0x6c) ===
++	 * From firmware disassembly at offset 0x0090fae5-0x0090fbb6.
++	 * This configures the display path before EDID read.
++	 * Same data for both HDMI and USB-C (firmware uses identical constants).
 +	 */
++	memset(buf, 0, sizeof(buf));
 +	msg->service_id = ICC_HDMI_SERVICE_ID;
 +	msg->msg_type = 0;
-+	msg->length = 0x20;
-+	msg->data[0] = ICC_HDMI_CMD_READ_EDID;
-+	*(u16 *)&msg->data[1] = 0x000c;
-+	msg->data[3] = 1;
-+	msg->data[4] = 1;
-+	msg->data[5] = 8;
-+	msg->data[6] = 1;
-+	msg->data[7] = 1;
-+	msg->data[8] = 1;
-+	msg->data[9] = ICC_HDMI_EDID_I2C_ADDR;
-+	msg->data[10] = 0;
++	msg->length = 0x6c;
++	msg->data[0] = ICC_HDMI_CMD_READ_EDID;  /* 4 */
++	*(u16 *)&msg->data[1] = 0x0060;          /* payload length */
++	msg->data[3] = 9;                         /* sub-command: setup */
 +
-+	pr_info("[USBC] Sending ICC HDMI EDID read query\n");
++	/* Display configuration data (from firmware movabs instructions).
++	 * Contains I2C register writes to FLAVA3 IC (0x7a) and other
++	 * display path configuration. The south bridge handles routing
++	 * appropriately for USB-C vs HDMI.
++	 */
++	{
++		static const u8 setup_data[] = {
++			/* data[4..11] */  0x02, 0x0c, 0x02, 0x02, 0x01, 0x74, 0x19, 0x05,
++			/* data[12..15] */ 0x01, 0x74, 0x0a, 0xff,
++			/* data[16..23] */ 0x03, 0x08, 0x03, 0x01, 0x00, 0x74, 0x0a, 0xff,
++			/* data[24..27] */ 0x02, 0x0c, 0x02, 0x02,
++			/* data[28..35] */ 0x01, 0x74, 0x04, 0x00, 0x01, 0x7a, 0x88, 0xff,
++			/* data[36..43] */ 0x03, 0x08, 0x03, 0x01, 0x00, 0x7a, 0x84, 0x01,
++			/* data[44] */      0x02,
++			/* data[45..46] */ 0x08, 0x02,
++			/* data[47] */      0x01,
++			/* data[48..55] */ 0x01, 0x7a, 0x8b, 0x05, 0x03, 0x08, 0x01, 0x01,
++			/* data[56] */      0x00,
++			/* data[57..60] */ 0x14, 0x00, 0x00, 0x02,
++			/* data[61] */      0x14,
++			/* data[62] */      0x02,
++			/* data[63] */      0x04,
++			/* data[64..71] */ 0x01, 0x7a, 0x80, 0xa9, 0x01, 0x7a, 0x81, 0x20,
++			/* data[72..79] */ 0x01, 0x7a, 0x82, 0x00, 0x01, 0x7a, 0x83, 0x81,
++			/* data[80..87] */ 0x03, 0x08, 0x02, 0x01, 0x00, 0x7a, 0x84, 0xa0,
++			/* data[88..95] */ 0x03, 0x08, 0x03, 0x01, 0x00, 0x7a, 0x84, 0x01,
++		};
++		memcpy(&msg->data[4], setup_data, sizeof(setup_data));
++	}
++
++	pr_info("[USBC] Sending ICC HDMI setup command (0x6c bytes)\n");
 +
 +	ret = icc_query(buf, buf);
 +	if (ret) {
-+		pr_err("[USBC] ICC EDID read query failed: %d\n", ret);
++		pr_err("[USBC] ICC setup command failed: %d\n", ret);
 +		mutex_lock(&usbc_edid_lock);
 +		usbc_edid_pending = false;
 +		mutex_unlock(&usbc_edid_lock);
 +		return ret;
 +	}
 +
-+	/* Check query reply status.
-+	 * The reply should have:
-+	 *   service_id = 0x10
-+	 *   msg_type   = 0x4000 (reply)
-+	 *   data[0]    = 0 (status OK)
-+	 *   data[1]    = 0 (status OK)
-+	 */
++	/* Check setup reply status */
 +	{
 +		struct icc_msg *reply = (struct icc_msg *)buf;
 +		size_t reply_data_len = reply->length > sizeof(*reply) ?
 +			reply->length - sizeof(*reply) : 0;
 +
-+		pr_info("[USBC] ICC EDID reply: service_id=0x%02x msg_type=0x%04x length=%u data_len=%zu\n",
++		pr_info("[USBC] Setup reply: service_id=0x%02x msg_type=0x%04x length=%u\n",
++			reply->service_id, reply->msg_type, reply->length);
++
++		if (reply_data_len >= 2) {
++			pr_info("[USBC] Setup status: data[0]=%d data[1]=%d\n",
++				reply->data[0], reply->data[1]);
++			if (reply->data[0] != 0 || reply->data[1] != 0) {
++				pr_err("[USBC] Setup command returned error status\n");
++				mutex_lock(&usbc_edid_lock);
++				usbc_edid_pending = false;
++				mutex_unlock(&usbc_edid_lock);
++				return -EIO;
++			}
++		}
++	}
++
++	/* === Step 2: Send EDID read command (length=0x20) ===
++	 * From firmware disassembly at offset 0x0090fc87-0x0090fce7.
++	 * The reply contains only status; EDID data comes via notification.
++	 */
++	memset(buf, 0, sizeof(buf));
++	msg->service_id = ICC_HDMI_SERVICE_ID;
++	msg->msg_type = 0;
++	msg->length = 0x20;
++	msg->data[0] = ICC_HDMI_CMD_READ_EDID;   /* 4 */
++	*(u16 *)&msg->data[1] = 0x000c;           /* payload length */
++	msg->data[3] = 1;                          /* sub-command: read EDID */
++	msg->data[4] = 1;
++	msg->data[5] = 8;
++	msg->data[6] = 1;
++	msg->data[7] = 1;
++	msg->data[8] = 1;
++	msg->data[9] = ICC_HDMI_EDID_I2C_ADDR;   /* 0x7c */
++	msg->data[10] = 0;
++
++	pr_info("[USBC] Sending ICC HDMI EDID read command (0x20 bytes)\n");
++
++	ret = icc_query(buf, buf);
++	if (ret) {
++		pr_err("[USBC] ICC EDID read command failed: %d\n", ret);
++		mutex_lock(&usbc_edid_lock);
++		usbc_edid_pending = false;
++		mutex_unlock(&usbc_edid_lock);
++		return ret;
++	}
++
++	/* Check EDID read reply status */
++	{
++		struct icc_msg *reply = (struct icc_msg *)buf;
++		size_t reply_data_len = reply->length > sizeof(*reply) ?
++			reply->length - sizeof(*reply) : 0;
++
++		pr_info("[USBC] EDID read reply: service_id=0x%02x msg_type=0x%04x length=%u data_len=%zu\n",
 +			reply->service_id, reply->msg_type, reply->length, reply_data_len);
 +
 +		if (reply_data_len > 0) {
@@ -10385,11 +10455,9 @@ index 000000000..ec444a62b
 +				       16, 1, reply->data, min_t(size_t, reply_data_len, 64), true);
 +		}
 +
-+		/* Check if EDID data is in the reply directly */
++		/* Check if EDID data is in the reply directly (unlikely but check) */
 +		if (reply_data_len >= 4 && reply->data[0] == 0 && reply->data[1] == 0) {
-+			/* Status OK — EDID might be in the reply or come via notification */
 +			if (reply_data_len > 8) {
-+				/* Check if data[8] looks like EDID (0x00 = EDID header byte 1) */
 +				if (reply->data[8] == 0x00 || reply->data[8] == 0xff) {
 +					size_t edid_len = reply_data_len - 8;
 +					if (edid_len <= max_len && edid_len >= EDID_LENGTH) {
@@ -10405,7 +10473,12 @@ index 000000000..ec444a62b
 +		}
 +	}
 +
-+	/* EDID not in reply — wait for ICC notification */
++	/* === Step 3: Wait for EDID via ICC notification ===
++	 * The south bridge sends EDID asynchronously via ICC notification
++	 * (service_id=0x10, data[1]==0x02). The notification is received
++	 * by hdmi_notification_handler() which forwards it to us via
++	 * ps5_usbc_handle_edid_notification().
++	 */
 +	pr_info("[USBC] Waiting for EDID notification...\n");
 +	timeout = wait_for_completion_timeout(&usbc_edid_done,
 +					      msecs_to_jiffies(3000));
