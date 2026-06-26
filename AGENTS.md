@@ -37,10 +37,39 @@ The patch is applied on top of stock Linux kernel (v7.1.y) via `git apply`.
 
 ## Modifying linux.patch
 When making changes to the kernel source in `/Volumes/FreeBSD/linux`:
-1. Make changes in the kernel source tree
-2. Regenerate `linux.patch` with the full diff from base (c9acdc466) to working tree
-3. Test with `git apply --check linux.patch` on a clean checkout
-4. Commit and push to trigger GitHub Actions build
+
+### Setup (clean baseline workflow)
+Always start from a clean tree with the current patch applied as a baseline commit:
+```sh
+cd /Volumes/FreeBSD/linux
+git reset HEAD -- .
+git checkout -- .
+git clean -fdx                          # remove all untracked files
+git apply /Users/bizkut/Downloads/PS5/Linux/ps5-linux-patches/linux.patch
+git add -A
+git commit -m "baseline: apply linux.patch"
+```
+This ensures all files (including new ones) are tracked, so `git diff` never misses anything.
+
+### Making changes
+1. Edit files in the kernel source tree (modifications and new files)
+2. Regenerate `linux.patch`:
+   ```sh
+   git diff HEAD~1 > /Users/bizkut/Downloads/PS5/Linux/ps5-linux-patches/linux.patch
+   ```
+3. Verify the patch round-trips:
+   ```sh
+   git stash                            # or: git checkout -- . && git clean -fdx
+   git apply --check linux.patch        # must pass
+   git apply linux.patch
+   git diff HEAD~1 --stat | tail -3     # should show same file count
+   ```
+4. Commit and push `linux.patch` to trigger GitHub Actions build
+
+### Why this workflow
+- `git diff HEAD~1` captures ALL changes (modifications + new files) with zero risk of missing untracked directories
+- The baseline commit makes it trivial to verify the patch round-trips
+- Previous ad-hoc approach (git add -N for specific dirs) missed files like `drivers/net/phy/mts/`, causing build failures
 
 ## Module Parameters (usbc driver)
 - `usbc_port_id` — USB-C port ID (default 0, device reports PortId=3)
