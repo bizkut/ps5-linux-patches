@@ -1889,7 +1889,7 @@ index f8c13bad4..378b6ede7 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..eb708a4d9 100644
+index a3cb05490..f40637e5b 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -1900,7 +1900,7 @@ index a3cb05490..eb708a4d9 100644
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_probe_helper.h>
-@@ -1100,6 +1101,96 @@ enum dc_edid_status dm_helpers_read_local_edid(
+@@ -1100,6 +1101,141 @@ enum dc_edid_status dm_helpers_read_local_edid(
  	if (link->dc->hwss.prepare_ddc)
  		link->dc->hwss.prepare_ddc(link);
  
@@ -1966,6 +1966,51 @@ index a3cb05490..eb708a4d9 100644
 +						(raw->prod_code[0] << 8) | raw->prod_code[1]);
 +				} else
 +					DRM_ERROR("PS5: AUX EDID fallback also failed\n");
++			}
++			/* If both ICC and AUX failed, create a fallback EDID
++			 * with standard DMT modes so the display can be used.
++			 * The PS5 south bridge only sends EDID notifications for
++			 * PSVR2 headsets, not arbitrary USB-C displays. The GPU
++			 * AUX engine times out because the combo PHY's AUX channel
++			 * is not physically routed to the USB-C display.
++			 */
++			if (!drm_edid) {
++				struct edid *fallback_edid;
++				fallback_edid = kmalloc(EDID_LENGTH, GFP_KERNEL);
++				if (fallback_edid) {
++					memset(fallback_edid, 0, EDID_LENGTH);
++					fallback_edid->header[0] = 0x00;
++					fallback_edid->header[1] = 0xff;
++					fallback_edid->header[2] = 0xff;
++					fallback_edid->header[3] = 0xff;
++					fallback_edid->header[4] = 0xff;
++					fallback_edid->header[5] = 0xff;
++					fallback_edid->header[6] = 0xff;
++					fallback_edid->header[7] = 0x00;
++					fallback_edid->mfg_id[0] = 0x0c;
++					fallback_edid->mfg_id[1] = 0x0c;
++					fallback_edid->prod_code[0] = 0x02;
++					fallback_edid->prod_code[1] = 0x00;
++					fallback_edid->version = 1;
++					fallback_edid->revision = 4;
++					fallback_edid->input = 0x80; /* digital input */
++					fallback_edid->width_cm = 60;
++					fallback_edid->height_cm = 34;
++					fallback_edid->features = 0x06; /* sRGB, continuous timing */
++					fallback_edid->mfg_week = 1;
++					fallback_edid->mfg_year = 30;
++					/* checksum */
++					{
++						u8 sum = 0;
++						int i;
++						for (i = 0; i < EDID_LENGTH - 1; i++)
++							sum += ((u8 *)fallback_edid)[i];
++						((u8 *)fallback_edid)[EDID_LENGTH - 1] = (256 - sum) & 0xff;
++					}
++					drm_edid = drm_edid_alloc(fallback_edid, EDID_LENGTH);
++					kfree(fallback_edid);
++					DRM_INFO("PS5: Using fallback EDID for USB-C (no ICC/AUX EDID available)\n");
++				}
 +			}
 +		}
 +		drm_edid_connector_update(connector, drm_edid);
