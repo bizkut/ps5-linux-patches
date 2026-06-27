@@ -1917,7 +1917,7 @@ index f8c13bad4..b15f9c289 100644
  
  	/* Handle connector state changes */
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
-index a3cb05490..465528279 100644
+index a3cb05490..a92f2a16e 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
 @@ -29,6 +29,7 @@
@@ -2090,7 +2090,7 @@ index a3cb05490..465528279 100644
 +					memset(fb + EDID_LENGTH, 0, EDID_LENGTH);
 +					fb[0x80] = 0x02; /* tag: CTA-861 */
 +					fb[0x81] = 0x03; /* revision 3 */
-+					fb[0x82] = 0x04; /* DTD start = byte 4 (no DTDs before data blocks) */
++					fb[0x82] = 0x00; /* DTD start = 0 (no DTDs, data blocks to end) */
 +					fb[0x83] = 0x00; /* number of DTDs */
 +					fb[0x84] = 0x80; /* underscan, RGB 4:4:4 */
 +					/* Short Video Descriptor data block:
