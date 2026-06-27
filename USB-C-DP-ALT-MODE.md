@@ -104,17 +104,58 @@ Three approaches tried, all fail:
 3. **I2C buses** — no devices detected on any I2C bus (i2c-0 through i2c-3)
    for USB-C. The display's EDID is not accessible via I2C.
 
-### WORKAROUND — Fallback EDID
-When both ICC and AUX fail, a minimal EDID (v1.4, digital input, sRGB,
-continuous timing) is created so the DRM subsystem can set standard modes
-like 1920x1080@60Hz. This doesn't give the display's native resolution
-but allows a usable signal.
+### WORKAROUND — Fallback EDID (2-block, with modes)
+When both ICC and AUX fail, a 2-block fallback EDID (256 bytes) is created:
+- **Block 0**: EDID 1.4 base — digital input, sRGB chromaticity, continuous timing
+  - Established timings: 640x480@60, 1024x768@60
+  - Standard timings: 1920x1080@60 (16:9), 1280x720@60 (16:9), 1024x768@60 (4:3), 640x480@60 (4:3)
+- **Block 1**: CTA-861 extension — SVDs for VIC 4 (1280x720@60), VIC 16 (1920x1080@60),
+  VIC 2 (720x480@60), VIC 19 (1280x720@50)
+
+The fallback EDID is stored in global `usbc_fallback_edid` and returned via
+`drm_edid_override_get()` for DP-2, ensuring all EDID read paths get it
+consistently.
+
+### EDID Override Flow (FIXED)
+Multiple code paths read EDID for DP-2. The fallback EDID must be visible
+to all of them:
+
+1. **`dm_helpers_read_local_edid`** (DC link detect) — creates the fallback
+   EDID when ICC+AUX fail, stores it in `usbc_fallback_edid`
+2. **`drm_edid_override_get`** (DRM core) — returns `usbc_fallback_edid` for
+   DP-2 when no other override/firmware EDID is available
+3. **`create_eml_sink`** (amdgpu_dm) — calls `drm_edid_read_ddc` (AUX, fails),
+   then falls back to `drm_edid_read` which checks `edid_override` → gets
+   the fallback EDID. Sets `aconnector->drm_edid` for `get_modes`.
+4. **`amdgpu_dm_connector_funcs_force`** — same fallback to `drm_edid_read`
+5. **`drm_connector_helper_get_modes`** (DRM probe helper) — calls
+   `drm_edid_read` which checks `edid_override` → gets fallback EDID
+
+**Bug found and fixed**: `create_eml_sink` and `funcs_force` called
+`drm_edid_read_ddc` directly (bypasses override), so `aconnector->drm_edid`
+stayed NULL. `amdgpu_dm_connector_get_modes` uses `aconnector->drm_edid`,
+not the connector's EDID property — so it only added 640x480 via
+`drm_add_modes_noedid`. Fixed by falling back to `drm_edid_read` (which
+checks override) when `drm_edid_read_ddc` fails.
 
 ### Root Cause: `real_edid` Override Bug (FIXED)
 Previous boots showed DP-2 with HDMI's EDID because `drm_edid_override_get()`
 has a PS5-specific fallback that returns `real_edid` (HDMI EDID from `hdmi.c`)
 for ALL connectors. Fixed by checking `strcmp(connector->name, "DP-2") != 0`
 — only DP-2 (USB-C) is excluded from the `real_edid` override.
+
+### EDID Construction Bugs Found and Fixed
+Several bugs in the fallback EDID construction were identified via
+`edid-decode`:
+- Established timings at wrong offset (0x24 instead of 0x23)
+- Standard timings at wrong offset (0x28 instead of 0x26)
+- Wrong hsize formula: used `(hactive-256)/8`, correct is `(hactive-248)/8`
+- Wrong aspect ratio encoding: 16:9 should be `0xC0`, 4:3 should be `0x40`
+- Unused standard timing entries should be `0x01,0x01` not `0x00,0x00`
+- Features byte: `0xa0` (sRGB + continuous timing, no preferred) not `0x06`
+- CTA-861 DTD start: `0x00` (no DTDs) not `0x04` (caused SVD block to be
+  interpreted as a DTD, producing bogus 4x19@17348Hz mode)
+- Removed broken speaker allocation and HDMI VSDB data blocks
 
 ### Key Discovery: South Bridge vs PD Controller HPD
 - `GET_DEV_CONN_STATE` (PD controller): `Hpd(0)` — always 0
@@ -123,43 +164,38 @@ for ALL connectors. Fixed by checking `strcmp(connector->name, "DP-2") != 0`
 - The south bridge's HPD is a separate hardware/software signal
 - The south bridge sees HPD=1 but still doesn't send EDID notifications
 
-### Latest Boot Log Analysis (2026-06-26)
+### Latest Boot Log Analysis (2026-06-27)
 ```
 # HDMI (DP-1) — working
 hdmi: got real edid                                    # PS5 OS reads HDMI EDID
 PS5:  HDMI PHY CNTL0=0x30110704                        # HDMI PHY configured
 PS5: dce_aux_transfer_raw: en=0 ... operation_result=0 # HDMI AUX works (94 transfers)
 
-# USB-C (DP-2) — connected, EDID unavailable
+# USB-C (DP-2) — connected, EDID unavailable, fallback EDID used
 usbc: DP alt mode active at boot
 PS5:  Set DP_IS_USB_C and usbc_combo_phy for USB-C connector (enum_id=2)
-PS5:  Combo PHY DP alt mode at init: ENABLED
 usbc: Sending Start EMC service (service_id=0x70, data[0]=0)
-usbc: EMC service reply: service_id=0x70 msg_type=0x4086 length=32
 usbc: EMC service status: data[0]=4 data[1]=0          # OK
-usbc: Querying HotPlug status via ICC
 usbc: HotPlug status: data[4]=0x01 HPD=1               # South bridge sees HPD!
-usbc: Sending ICC HDMI setup command (0x6c bytes)
 usbc: Setup status: data[0]=0 data[1]=0                # OK
-usbc: Sending ICC HDMI EDID read command (0x20 bytes)
-usbc: EDID read reply: data_len=29                     # Reply has status only
-usbc: Waiting for EDID notification...
-usbc: EDID notification timeout                        # 3s timeout — no notification
+usbc: EDID notification timeout                        # 3s — no notification
 
-# AUX fallback — uses correct engine but times out
-PS5:  After AUX fix: AUX_CONTROL=0x01250001            # AUX_EN=1 HPD_SEL=2 IGNORE_HPD=1
-PS5:  Combo PHY DPALT_DISABLE = 0
-PS5: link_aux_transfer_raw: ddc_pin=... en=1 addr=0x0050  # Correct engine!
-PS5: dce_aux_transfer_raw: en=1 addr=0x0050 operation_result=3  # TIMEOUT x30
-AUX: HPD_DISCON but DONE — continuing (PS5 USB-C)      # Workaround fires once
+# AUX fallback — correct engine but times out
+PS5: link_aux_transfer_raw: en=1 addr=0x0050 operation_result=3  # TIMEOUT x30
 
-# Fallback EDID
-PS5: Using fallback EDID for USB-C (no ICC/AUX EDID available)
-PS5: emulated_link_detect: EDID status=0
+# Fallback EDID created and stored in usbc_fallback_edid
+PS5: drm_edid_override_get: DP-2 fallback check: usbc_fallback_edid=0x0  # 1st probe (too early)
+PS5: Using fallback EDID for USB-C (2-block, modes: 1920x1080 1280x720 1024x768 640x480)
+PS5: emulated_link_detect: EDID status=0               # OK
+PS5: drm_edid_override_get: DP-2 fallback check: usbc_fallback_edid=0x320f74b8  # 3rd probe (has EDID)
+
+# EDID visible in sysfs (256 bytes)
+$ wc -c /sys/class/drm/card0-DP-2/edid → 256
+$ edid-decode /sys/class/drm/card0-DP-2/edid → valid, modes decoded
 
 # Result
 DP-1: connected, enabled, 2560x1440 + 1920x1080 modes
-DP-2: connected, disabled, no modes (fallback EDID has no detailed timings)
+DP-2: connected, disabled — modes pending create_eml_sink fix (next boot)
 ```
 
 ### Key Issues Identified
@@ -1080,15 +1116,14 @@ Recommendation: keep for now until full pipeline works, then test removing.
 ## Next Steps
 
 ### High priority — getting USB-C display to produce output
-1. **Test fallback EDID** — verify the minimal EDID allows DP-2 to be enabled
-   with standard modes (1920x1080@60Hz). The fallback EDID has no detailed
-   timings but advertises continuous timing support.
-   - May need to add a DisplayID or CTA-861 extension block with standard
-     modes if the base EDID alone doesn't provide enough modes.
-   - May need to force DP-2 enabled via `xrandr --output DP-2 --mode 1920x1080`
+1. **Test create_eml_sink fix** — the latest commit adds `drm_edid_read`
+   fallback in `create_eml_sink` and `funcs_force`. This should set
+   `aconnector->drm_edid` from the fallback EDID override, allowing
+   `amdgpu_dm_connector_get_modes` to add modes (1920x1080, 1280x720, etc.)
+   instead of just 640x480.
 
-2. **DP link training** — even with EDID, link training via AUX will fail
-   (AUX1 times out). Need to either:
+2. **DP link training** — even with EDID and modes, link training via AUX
+   will fail (AUX1 times out). Need to either:
    - Implement ICC-based DPCD read/write (firmware uses ICC for DP link status)
    - Or skip link training and force a fixed link rate (e.g. RBR 1.62 Gbps)
    - The kernel's `dc_link_dp_perform_link_training()` uses AUX for DPCD
@@ -1131,8 +1166,8 @@ Recommendation: keep for now until full pipeline works, then test removing.
 - `drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.h` — DPCS_DCN201_MASK_SH_LIST cleanup
 - `drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c` — DPCS_DCN2_CMN_REG_LIST in link_regs, DPALT shift/mask defines, missing register offset defines, LE_SF entries
 - `drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h` — acquire_phy/release_phy function pointers
-- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log, force=ON for USB-C
-- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — ICC-based EDID read for USB-C DP alt mode, AUX fallback with `drm_edid_read_ddc`, fallback EDID generation when both ICC and AUX fail, EDID mfg/product logging
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c` — HPD callback, emulated detect, acquire_phy call, aux_mode debug log, force=ON for USB-C, `drm_edid_read` fallback in `create_eml_sink` and `funcs_force` for USB-C
+- `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c` — ICC-based EDID read for USB-C DP alt mode, AUX fallback with `drm_edid_read_ddc`, 2-block fallback EDID generation (base + CTA-861) stored in `usbc_fallback_edid`, EDID mfg/product logging
 - `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c` — `dm_dp_aux_transfer` debug logging (ddc_service, ddc_pin, addr, len)
 - `drivers/gpu/drm/amd/display/dc/dce/dce_aux.c` — AUX transfer debug logging (en, addr, operation_result, returned_bytes), HPD_DISCON workaround (continue if DONE)
 
