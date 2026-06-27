@@ -8673,12 +8673,150 @@ index 000000000..4af890c84
 +MODULE_AUTHOR("Andy Nguyen");
 +MODULE_DESCRIPTION("PlayStation 5 MP1 SMU driver");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/ps5/sflash_dump.c b/drivers/ps5/sflash_dump.c
+new file mode 100644
+index 000000000..637fb1def
+--- /dev/null
++++ b/drivers/ps5/sflash_dump.c
+@@ -0,0 +1,132 @@
++/*
++ * PS5 Serial Flash Dump Module
++ *
++ * Reads the 2MB PCIe BAR2 region of the spcie device and exports it
++ * via debugfs as /sys/kernel/debug/ps5_sflash_dump.
++ *
++ * The 2MB BAR2 region is believed to be the serial flash (W25Q16JVNIM)
++ * or a window into it. The EMC firmware is at offset 0x4000, size 0x7E000.
++ *
++ * Build: make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
++ * Load:  insmod sflash_dump.ko
++ * Read:  dd if=/sys/kernel/debug/ps5_sflash_dump of=sflash.bin bs=4096
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/io.h>
++
++#define SFLASH_SIZE (2 * 1024 * 1024) /* 2MB */
++
++static struct dentry *dump_entry;
++static void __iomem *sflash_base;
++static struct pci_dev *pdev;
++
++static ssize_t sflash_read(struct file *filp, char __user *buf,
++			   size_t count, loff_t *ppos)
++{
++	loff_t pos = *ppos;
++	size_t to_read;
++	u8 *tmp;
++	ssize_t ret;
++
++	if (pos >= SFLASH_SIZE)
++		return 0;
++	if (pos + count > SFLASH_SIZE)
++		count = SFLASH_SIZE - pos;
++	to_read = count;
++
++	tmp = kmalloc(min_t(size_t, to_read, PAGE_SIZE), GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
++	ret = 0;
++	while (to_read > 0) {
++		size_t chunk = min_t(size_t, to_read, PAGE_SIZE);
++
++		/* Read from MMIO in page-sized chunks to avoid issues */
++		memcpy_fromio(tmp, sflash_base + pos, chunk);
++
++		if (copy_to_user(buf + ret, tmp, chunk)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ret += chunk;
++		pos += chunk;
++		to_read -= chunk;
++	}
++
++	kfree(tmp);
++
++	if (ret > 0)
++		*ppos = pos;
++
++	return ret;
++}
++
++static const struct file_operations sflash_fops = {
++	.owner = THIS_MODULE,
++	.read = sflash_read,
++	.llseek = default_llseek,
++};
++
++static int __init sflash_dump_init(void)
++{
++	struct resource *res;
++
++	pdev = pci_get_device(PCI_VENDOR_ID_SONY, 0x9107, NULL);
++	if (!pdev) {
++		pr_err("ps5_sflash: spcie device not found\n");
++		return -ENODEV;
++	}
++
++	/* BAR2 = region index 2 = 2MB at 0x85200000 */
++	res = &pdev->resource[2];
++	if (!res->start || resource_size(res) < SFLASH_SIZE) {
++		pr_err("ps5_sflash: BAR2 not available or too small (start=%llx size=%llx)\n",
++		       (u64)res->start, (u64)resource_size(res));
++		pci_dev_put(pdev);
++		return -ENODEV;
++	}
++
++	sflash_base = ioremap(res->start, SFLASH_SIZE);
++	if (!sflash_base) {
++		pr_err("ps5_sflash: ioremap failed for %llx\n", (u64)res->start);
++		pci_dev_put(pdev);
++		return -ENOMEM;
++	}
++
++	dump_entry = debugfs_create_file("ps5_sflash_dump", 0444, NULL, NULL,
++					 &sflash_fops);
++	if (IS_ERR(dump_entry)) {
++		pr_err("ps5_sflash: debugfs_create_file failed\n");
++		iounmap(sflash_base);
++		pci_dev_put(pdev);
++		return PTR_ERR(dump_entry);
++	}
++
++	pr_info("ps5_sflash: 2MB serial flash dump at debugfs/ps5_sflash_dump (BAR2 @ %llx)\n",
++		(u64)res->start);
++	pci_dev_put(pdev);
++	return 0;
++}
++
++static void __exit sflash_dump_exit(void)
++{
++	debugfs_remove(dump_entry);
++	if (sflash_base)
++		iounmap(sflash_base);
++	pr_info("ps5_sflash: unloaded\n");
++}
++
++module_init(sflash_dump_init);
++module_exit(sflash_dump_exit);
++
++MODULE_AUTHOR("PS5 Linux");
++MODULE_DESCRIPTION("PS5 Serial Flash Dump via PCIe BAR2");
++MODULE_LICENSE("GPL");
 diff --git a/drivers/ps5/spcie.c b/drivers/ps5/spcie.c
 new file mode 100644
-index 000000000..365262237
+index 000000000..ec2cacaa6
 --- /dev/null
 +++ b/drivers/ps5/spcie.c
-@@ -0,0 +1,1151 @@
+@@ -0,0 +1,1244 @@
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 +
 +#include <linux/module.h>
@@ -8720,6 +8858,20 @@ index 000000000..365262237
 +#define ICC_IOC_MAGIC		'I'
 +
 +#define ICC_FAN_CHANGE_SERVO_PATTERN	_IOW(ICC_IOC_MAGIC, 1, u8)
++#define ICC_RAW_QUERY			_IOWR(ICC_IOC_MAGIC, 2, struct icc_raw_query)
++#define ICC_BAR2_READ			_IOWR(ICC_IOC_MAGIC, 3, struct icc_bar2_read)
++
++struct icc_raw_query {
++	u32 query_len;		/* input: length of query data */
++	u32 reply_len;		/* input: max reply buffer size, output: actual reply length */
++	u64 data;		/* pointer to query/reply buffer (in-place) */
++};
++
++struct icc_bar2_read {
++	u32 offset;		/* offset within BAR2 (2MB region) */
++	u32 size;		/* number of bytes to read (max 4096) */
++	u64 data;		/* pointer to output buffer */
++};
 +
 +#define GDDR6_SAMSUNG		0x01
 +#define GDDR6_HYNIX		0x06
@@ -9424,6 +9576,85 @@ index 000000000..365262237
 +		if (copy_from_user(&pattern, (u8 __user *)arg, sizeof(u8)))
 +			return -EFAULT;
 +		return icc_fan_change_servo_pattern(pattern);
++	}
++
++	case ICC_RAW_QUERY:
++	{
++		struct icc_raw_query rq;
++		u8 *buf;
++		int ret;
++
++		if (copy_from_user(&rq, (void __user *)arg, sizeof(rq)))
++			return -EFAULT;
++		if (rq.query_len < ICC_MSG_MIN_SIZE || rq.query_len > ICC_MSG_MAX_SIZE)
++			return -EINVAL;
++		if (rq.reply_len < ICC_MSG_MIN_SIZE || rq.reply_len > ICC_MSG_MAX_SIZE)
++			return -EINVAL;
++
++		buf = kmalloc(max(rq.query_len, rq.reply_len), GFP_KERNEL);
++		if (!buf)
++			return -ENOMEM;
++
++		if (copy_from_user(buf, (void __user *)rq.data, rq.query_len)) {
++			kfree(buf);
++			return -EFAULT;
++		}
++
++		ret = icc_query(buf, buf);
++		if (ret) {
++			kfree(buf);
++			return ret;
++		}
++
++		/* The reply length is in the icc_msg length field */
++		{
++			struct icc_msg *msg = (struct icc_msg *)buf;
++			u32 actual = msg->length;
++			if (actual > rq.reply_len)
++				actual = rq.reply_len;
++			rq.reply_len = actual;
++			if (copy_to_user((void __user *)arg, &rq, sizeof(rq))) {
++				kfree(buf);
++				return -EFAULT;
++			}
++			if (copy_to_user((void __user *)rq.data, buf, actual)) {
++				kfree(buf);
++				return -EFAULT;
++			}
++		}
++
++		kfree(buf);
++		return 0;
++	}
++
++	case ICC_BAR2_READ:
++	{
++		struct icc_bar2_read br;
++		u8 *buf;
++
++		if (copy_from_user(&br, (void __user *)arg, sizeof(br)))
++			return -EFAULT;
++		if (br.size == 0 || br.size > 4096)
++			return -EINVAL;
++		if ((u64)br.offset + br.size > 0x200000)
++			return -EINVAL;
++		if (!sdev || !sdev->bar2)
++			return -ENODEV;
++
++		buf = kmalloc(br.size, GFP_KERNEL);
++		if (!buf)
++			return -ENOMEM;
++
++		/* Use memcpy_fromio for safe MMIO read */
++		memcpy_fromio(buf, sdev->bar2 + br.offset, br.size);
++
++		if (copy_to_user((void __user *)br.data, buf, br.size)) {
++			kfree(buf);
++			return -EFAULT;
++		}
++
++		kfree(buf);
++		return 0;
 +	}
 +
 +	default:
