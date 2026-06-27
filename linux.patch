@@ -1579,7 +1579,7 @@ index 52f4e9e09..6e4ff7444 100644
  	if (r)
  		return r;
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index f8c13bad4..02926601d 100644
+index f8c13bad4..649ed89bd 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -80,6 +80,10 @@
@@ -1625,7 +1625,7 @@ index f8c13bad4..02926601d 100644
  	link->type = dc_connection_none;
  	prev_sink = link->local_sink;
  
-@@ -3421,6 +3434,24 @@ static void emulated_link_detect(struct dc_link *link)
+@@ -3421,6 +3434,41 @@ static void emulated_link_detect(struct dc_link *link)
  		return;
  	}
  
@@ -1647,10 +1647,27 @@ index f8c13bad4..02926601d 100644
 +		drm_info(dev, "[PS5] emulated_link_detect: acquire_phy=%d\n", acquired);
 +	}
 +
++	/* PS5: For USB-C DP alt mode, the combo PHY's AUX channel is not
++	 * physically routed to the USB-C display. All AUX transfers time out.
++	 * Disable AUX access so link training uses the auxless path
++	 * (dp_perform_link_training_skip_aux) which configures the PHY
++	 * and sends training patterns without reading DPCD status.
++	 *
++	 * Also force RBR (1.62 Gbps) x 4 lanes as the verified link cap.
++	 * The actual link rate will be whatever the PHY is configured for;
++	 * RBR is the safest starting point for blind link training.
++	 */
++	if (link->link_enc && link->link_enc->features.flags.bits.DP_IS_USB_C) {
++		link->aux_access_disabled = true;
++		link->verified_link_cap.link_rate = LINK_RATE_LOW; /* RBR 1.62 Gbps */
++		link->verified_link_cap.lane_count = LANE_COUNT_FOUR;
++		drm_info(dev, "[PS5] emulated_link_detect: USB-C — aux_access_disabled=1, forced RBR x4\n");
++	}
++
  	sink_init_data.link = link;
  	sink_init_data.sink_signal = sink_caps.signal;
  
-@@ -3438,6 +3469,8 @@ static void emulated_link_detect(struct dc_link *link)
+@@ -3438,6 +3486,8 @@ static void emulated_link_detect(struct dc_link *link)
  			link,
  			sink);
  
@@ -1659,7 +1676,7 @@ index f8c13bad4..02926601d 100644
  	if (edid_status != EDID_OK)
  		drm_err(dev, "Failed to read EDID\n");
  
-@@ -4222,8 +4255,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+@@ -4222,8 +4272,13 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
  	bool ret = false;
  	bool debounce_required = false;
  
@@ -1674,7 +1691,7 @@ index f8c13bad4..02926601d 100644
  
  	/*
  	 * In case of failure or MST no need to update connector status or notify the OS
-@@ -4243,6 +4281,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+@@ -4243,6 +4298,9 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
  	if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
  		drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
  
@@ -1684,7 +1701,7 @@ index f8c13bad4..02926601d 100644
  	/*
  	 * Check for HDMI disconnect with debounce enabled.
  	 */
-@@ -4315,6 +4356,81 @@ static void handle_hpd_irq(void *param)
+@@ -4315,6 +4373,81 @@ static void handle_hpd_irq(void *param)
  
  }
  
@@ -1766,7 +1783,7 @@ index f8c13bad4..02926601d 100644
  static void schedule_hpd_rx_offload_work(struct amdgpu_device *adev, struct hpd_rx_irq_offload_work_queue *offload_wq,
  							union hpd_irq_data hpd_irq_data)
  {
-@@ -4479,6 +4595,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
+@@ -4479,6 +4612,13 @@ static int register_hpd_handlers(struct amdgpu_device *adev)
  	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
  	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
  
@@ -1780,7 +1797,7 @@ index f8c13bad4..02926601d 100644
  	if (dc_is_dmub_outbox_supported(adev->dm.dc)) {
  		if (!register_dmub_notify_callback(adev, DMUB_NOTIFICATION_HPD,
  			dmub_hpd_callback, true)) {
-@@ -6880,6 +7003,12 @@ static void fill_stream_properties_from_drm_display_mode(
+@@ -6880,6 +7020,12 @@ static void fill_stream_properties_from_drm_display_mode(
  
  	stream->output_color_space = get_output_color_space(timing_out, connector_state);
  	stream->content_type = get_output_content_type(connector_state);
@@ -1793,7 +1810,7 @@ index f8c13bad4..02926601d 100644
  }
  
  static void fill_audio_info(struct audio_info *audio_info,
-@@ -7983,12 +8112,21 @@ static void amdgpu_dm_connector_funcs_force(struct drm_connector *connector)
+@@ -7983,12 +8129,21 @@ static void amdgpu_dm_connector_funcs_force(struct drm_connector *connector)
  	struct i2c_adapter *ddc;
  	struct drm_device *dev = connector->dev;
  
@@ -1815,7 +1832,7 @@ index f8c13bad4..02926601d 100644
  	drm_edid_connector_update(connector, drm_edid);
  	if (!drm_edid) {
  		drm_err(dev, "No EDID found on connector: %s.\n", connector->name);
-@@ -8047,7 +8185,21 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
+@@ -8047,7 +8202,21 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
  	else
  		ddc = &aconnector->i2c->base;
  
@@ -1837,7 +1854,29 @@ index f8c13bad4..02926601d 100644
  	drm_edid_connector_update(connector, drm_edid);
  	if (!drm_edid) {
  		drm_err(connector->dev, "No EDID found on connector: %s.\n", connector->name);
-@@ -8269,6 +8421,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+@@ -8081,11 +8250,18 @@ static void handle_edid_mgmt(struct amdgpu_dm_connector *aconnector)
+ 
+ 	/*
+ 	 * In case of headless boot with force on for DP managed connector
+-	 * Those settings have to be != 0 to get initial modeset
++	 * Those settings have to be != 0 to get initial modeset.
++	 * For USB-C, use RBR x4 (set in emulated_link_detect) since AUX
++	 * is disabled and we do blind link training.
+ 	 */
+ 	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
+-		link->verified_link_cap.lane_count = LANE_COUNT_FOUR;
+-		link->verified_link_cap.link_rate = LINK_RATE_HIGH2;
++		if (link->link_enc && link->link_enc->features.flags.bits.DP_IS_USB_C) {
++			/* USB-C: already set to RBR x4 in emulated_link_detect */
++			link->aux_access_disabled = true;
++		} else {
++			link->verified_link_cap.lane_count = LANE_COUNT_FOUR;
++			link->verified_link_cap.link_rate = LINK_RATE_HIGH2;
++		}
+ 	}
+ 
+ 	create_eml_sink(aconnector);
+@@ -8269,6 +8445,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
  	 */
  	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
  
@@ -1849,7 +1888,7 @@ index f8c13bad4..02926601d 100644
  	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
  			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
  		return result;
-@@ -8995,6 +9152,10 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+@@ -8995,6 +9176,10 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
  
  	encoder = amdgpu_dm_connector_to_encoder(connector);
  
@@ -1860,7 +1899,7 @@ index f8c13bad4..02926601d 100644
  	if (!drm_edid) {
  		amdgpu_dm_connector->num_modes =
  				drm_add_modes_noedid(connector, 640, 480);
-@@ -9012,11 +9173,17 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+@@ -9012,11 +9197,17 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
  				amdgpu_dm_connector->num_modes += drm_add_modes_noedid(
  					connector, common_modes[i].w, common_modes[i].h);
  		}
@@ -1878,7 +1917,7 @@ index f8c13bad4..02926601d 100644
  	}
  	amdgpu_dm_fbc_init(connector);
  
-@@ -10957,12 +11124,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+@@ -10957,12 +11148,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
  	drm_atomic_helper_update_legacy_modeset_state(dev, state);
  	drm_dp_mst_atomic_wait_for_dependencies(state);
  
