@@ -17,7 +17,7 @@
 #include <linux/uaccess.h>
 
 #define CAVE_BASE       0x100000000ULL
-#define CAVE_LINUX_INFO (CAVE_BASE + 0xB000ULL)  /* cave_linux_info offset */
+#define CAVE_LINUX_INFO 0x100005000ULL  /* cave_hv_code(0x3000) + 0x2000 */
 
 /* Must match struct linux_info in ps5-linux-loader/include/linux.h */
 struct tmr {
