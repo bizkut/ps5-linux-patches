@@ -1579,7 +1579,7 @@ index 52f4e9e09..6e4ff7444 100644
  	if (r)
  		return r;
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index f8c13bad4..378b6ede7 100644
+index f8c13bad4..b15f9c289 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -80,6 +80,10 @@
@@ -1793,7 +1793,35 @@ index f8c13bad4..378b6ede7 100644
  }
  
  static void fill_audio_info(struct audio_info *audio_info,
-@@ -8269,6 +8398,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+@@ -7989,6 +8118,10 @@ static void amdgpu_dm_connector_funcs_force(struct drm_connector *connector)
+ 		ddc = &aconnector->i2c->base;
+ 
+ 	drm_edid = drm_edid_read_ddc(connector, ddc);
++#ifdef CONFIG_X86_PS5
++	if (!drm_edid)
++		drm_edid = drm_edid_read(connector);
++#endif
+ 	drm_edid_connector_update(connector, drm_edid);
+ 	if (!drm_edid) {
+ 		drm_err(dev, "No EDID found on connector: %s.\n", connector->name);
+@@ -8048,6 +8181,16 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
+ 		ddc = &aconnector->i2c->base;
+ 
+ 	drm_edid = drm_edid_read_ddc(connector, ddc);
++#ifdef CONFIG_X86_PS5
++	/* If DDC/AUX read failed, try drm_edid_read which checks
++	 * edid_override (used by PS5 fallback EDID for USB-C DP-2).
++	 * The AUX engine times out for USB-C (combo PHY not routed),
++	 * so drm_edid_read_ddc returns NULL. The fallback EDID is
++	 * stored in usbc_fallback_edid and returned via override.
++	 */
++	if (!drm_edid)
++		drm_edid = drm_edid_read(connector);
++#endif
+ 	drm_edid_connector_update(connector, drm_edid);
+ 	if (!drm_edid) {
+ 		drm_err(connector->dev, "No EDID found on connector: %s.\n", connector->name);
+@@ -8269,6 +8412,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
  	 */
  	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
  
@@ -1805,7 +1833,7 @@ index f8c13bad4..378b6ede7 100644
  	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
  			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
  		return result;
-@@ -10957,12 +11091,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+@@ -10957,12 +11105,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
  	drm_atomic_helper_update_legacy_modeset_state(dev, state);
  	drm_dp_mst_atomic_wait_for_dependencies(state);
  
