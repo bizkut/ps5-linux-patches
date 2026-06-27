@@ -1579,7 +1579,7 @@ index 52f4e9e09..6e4ff7444 100644
  	if (r)
  		return r;
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index f8c13bad4..66b74903c 100644
+index f8c13bad4..02926601d 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -80,6 +80,10 @@
@@ -1860,7 +1860,25 @@ index f8c13bad4..66b74903c 100644
  	if (!drm_edid) {
  		amdgpu_dm_connector->num_modes =
  				drm_add_modes_noedid(connector, 640, 480);
-@@ -10957,12 +11118,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+@@ -9012,11 +9173,17 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+ 				amdgpu_dm_connector->num_modes += drm_add_modes_noedid(
+ 					connector, common_modes[i].w, common_modes[i].h);
+ 		}
++		DRM_INFO("PS5: get_modes: no edid path, num_modes=%d\n",
++			amdgpu_dm_connector->num_modes);
+ 	} else {
+ 		amdgpu_dm_connector_ddc_get_modes(connector, drm_edid);
++		DRM_INFO("PS5: get_modes: after ddc_get_modes, num_modes=%d\n",
++			amdgpu_dm_connector->num_modes);
+ 		if (encoder)
+ 			amdgpu_dm_connector_add_common_modes(encoder, connector);
+ 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
++		DRM_INFO("PS5: get_modes: after common+freesync, num_modes=%d encoder=%p\n",
++			amdgpu_dm_connector->num_modes, encoder);
+ 	}
+ 	amdgpu_dm_fbc_init(connector);
+ 
+@@ -10957,12 +11124,82 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
  	drm_atomic_helper_update_legacy_modeset_state(dev, state);
  	drm_dp_mst_atomic_wait_for_dependencies(state);
  
