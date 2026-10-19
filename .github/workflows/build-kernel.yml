@@ -15,40 +15,72 @@ on:
         type: string
   workflow_call:
     inputs:
+      format:
+        description: 'Package format: deb, arch, rpm, or all'
+        type: string
+        default: 'all'
       patches_ref:
         type: string
         default: ''
+
+concurrency:
+  group: kernel-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 720
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
 
     env:
-      CCACHE_DIR: /home/opc/ccache
+      FORMAT: ${{ inputs.format || github.event.client_payload.format || 'all' }}
+      PATCHES_REPO: https://github.com/${{ github.repository }}.git
+      PATCHES_REF: ${{ inputs.patches_ref || github.sha }}
 
     steps:
+      - name: Check runner and prepare cache
+        run: |
+          case "$FORMAT" in
+            deb|arch|rpm|all) ;;
+            *) echo "::error::Unsupported package format: $FORMAT"; exit 1 ;;
+          esac
+          git --version
+          docker info > /dev/null
+          sudo -n true
+          mkdir -p "$HOME/.cache/ps5-linux-image/ccache"
+          printf 'CCACHE_DIR=%s\n' "$HOME/.cache/ps5-linux-image/ccache" >> "$GITHUB_ENV"
+
       - name: Clean image workspace
         # Docker containers write to image/linux-bin/ as root; actions/checkout's
         # git clean runs as the runner user and skips root-owned files, so stale
         # .deb / .pkg.tar.zst from prior kernel versions leak into the release.
-        run: sudo rm -rf image
+        run: |
+          if [[ -z "${GITHUB_WORKSPACE:-}" || "$GITHUB_WORKSPACE" != /* || "$GITHUB_WORKSPACE" =~ ^/+$ ]]; then
+            echo "::error::Refusing to clean an empty, root, or relative workspace"
+            exit 1
+          fi
+          sudo -n rm -rf -- "$GITHUB_WORKSPACE/image"
       - name: Checkout image builder
         uses: actions/checkout@v6
         with:
-          repository: ps5-linux/ps5-linux-image
+          repository: ${{ github.repository_owner }}/ps5-linux-image
           path: image
           ref: main
+          persist-credentials: false
 
       - name: Build kernel
         run: |
-          FORMAT="${{ inputs.format || github.event.client_payload.format || 'all' }}"
-          PATCHES_REF="${{ inputs.patches_ref || '' }}"
-          bash image/build_image.sh --kernel-only \
-            --distro "$FORMAT" \
-            --patches-ref "$PATCHES_REF"
-          # --distro all skips the rpm packager. Call the packager container
+          export FORMAT
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=url.https://github.com/gregkh/linux.git.insteadOf \
+          GIT_CONFIG_VALUE_0=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            bash image/build_image.sh --kernel-only --patches-ref "$PATCHES_REF"
+          # FORMAT=all builds deb and arch packages. Call the rpm packager
           # directly against the already-staged kernel (image/linux-bin/staging/)
           # instead of re-running build_image.sh, which wipes outputs and
           # rebuilds the kernel — that doubled CI time. This step is ~1 minute.
@@ -59,34 +91,59 @@ jobs:
               ps5-kernel-packager-rpm
           fi
 
-      - name: Read kernel and patches version
+      - name: Read kernel, patches, and builder versions
         id: version
         run: |
           psha=$(git -C image/work/ps5-linux-patches rev-parse --short HEAD)
+          patch_commit=$(git -C image/work/ps5-linux-patches rev-parse HEAD)
+          builder_commit=$(git -C image rev-parse HEAD)
           kver=$(cat image/linux-bin/VERSION)
-          ts=$(date -u +%Y%m%d-%H%M%S)
-          echo "kver=$kver" >> "$GITHUB_OUTPUT"
-          echo "psha=$psha" >> "$GITHUB_OUTPUT"
-          echo "ts=$ts" >> "$GITHUB_OUTPUT"
+          {
+            echo "kver=$kver"
+            echo "psha=$psha"
+            echo "patch_commit=$patch_commit"
+            echo "builder_commit=$builder_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Collect packages and compute checksums
+        id: sha
+        working-directory: image/linux-bin
+        run: |
+          shopt -s nullglob
+          case "$FORMAT" in
+            all) formats=(deb arch rpm) ;;
+            *) formats=("$FORMAT") ;;
+          esac
+          packages=()
+          for format in "${formats[@]}"; do
+            case "$format" in
+              deb) selected=(*.deb) ;;
+              arch) selected=(*.pkg.tar.zst) ;;
+              rpm) selected=(*.rpm) ;;
+            esac
+            if (( ${#selected[@]} == 0 )); then
+              echo "::error::No $format package found in image/linux-bin for requested format $FORMAT"
+              exit 1
+            fi
+            packages+=("${selected[@]}")
+          done
+          sha256sum -- "${packages[@]}" > SHA256SUMS
+          {
+            echo 'files<<FILESEOF'
+            printf 'image/linux-bin/%s\n' "${packages[@]}" SHA256SUMS
+            echo 'FILESEOF'
+            echo 'sums<<SHAEOF'
+            cat SHA256SUMS
+            echo 'SHAEOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
           name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
-          path: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
-            image/linux-bin/*.rpm
+          path: ${{ steps.sha.outputs.files }}
+          if-no-files-found: error
           retention-days: 7
-
-      - name: Compute checksums
-        id: sha
-        run: |
-          {
-            echo 'sums<<SHAEOF'
-            sha256sum image/linux-bin/*.deb image/linux-bin/*.pkg.tar.zst image/linux-bin/*.rpm 2>/dev/null | sed 's|image/linux-bin/||'
-            echo 'SHAEOF'
-          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update release
         if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
@@ -95,16 +152,17 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: kernel-${{ steps.version.outputs.kver }}-${{ steps.version.outputs.psha }}
           name: Kernel ${{ steps.version.outputs.kver }} (${{ steps.version.outputs.psha }})
+          target_commitish: ${{ steps.version.outputs.patch_commit }}
           body: |
             PS5 Linux kernel packages for **${{ steps.version.outputs.kver }}**.
 
-            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/ps5-linux/ps5-linux-patches/commit/${{ steps.version.outputs.psha }})
+            Patches: [`${{ steps.version.outputs.psha }}`](https://github.com/${{ github.repository }}/commit/${{ steps.version.outputs.patch_commit }})
+
+            Builder: [`${{ steps.version.outputs.builder_commit }}`](https://github.com/${{ github.repository_owner }}/ps5-linux-image/commit/${{ steps.version.outputs.builder_commit }})
 
             ```
             ${{ steps.sha.outputs.sums }}
             ```
-          files: |
-            image/linux-bin/*.deb
-            image/linux-bin/*.pkg.tar.zst
-            image/linux-bin/*.rpm
+          files: ${{ steps.sha.outputs.files }}
+          fail_on_unmatched_files: true
           make_latest: true
